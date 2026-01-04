@@ -136,4 +136,3 @@ class BaselineManager:
         
         self.set_baseline(device_id, baseline)
         logger.info(f"Baseline updated for {device_id}")
-
