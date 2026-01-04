@@ -456,4 +456,3 @@ class FlowAnalyzerManager:
                 pass
         
         return all_stats
-
