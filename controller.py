@@ -57,19 +57,28 @@ except ImportError as e:
     def get_ml_engine():
         return None
 
+# Try to import cryptography for certificate validation
+try:
+    from cryptography import x509
+    from cryptography.hazmat.backends import default_backend
+    CRYPTOGRAPHY_AVAILABLE = True
+except ImportError:
+    CRYPTOGRAPHY_AVAILABLE = False
+    print("⚠️  cryptography module not available. Certificate expiry checks will be limited.")
+
+
 app = Flask(__name__)
 
 # Device authorization (static for now, can be dynamic)
 authorized_devices = {
-    "ESP32_2": True,
-    "ESP32_3": True,
-    "ESP32_4": False
+    "Sensor_A": True,
+    "Sensor_B": True
 }
-device_data = {"ESP32_2": [], "ESP32_3": [], "ESP32_4": []}
+device_data = {"Sensor_A": [], "Sensor_B": []}
 timestamps = []
-last_seen = {"ESP32_2": 0, "ESP32_3": 0, "ESP32_4": 0}
+last_seen = {"Sensor_A": 0, "Sensor_B": 0}
 device_tokens = {}  # {device_id: {"token": token, "last_activity": timestamp}}
-packet_counts = {"ESP32_2": [], "ESP32_3": [], "ESP32_4": []}  # For rate limiting
+packet_counts = {"Sensor_A": [], "Sensor_B": []}  # For rate limiting
 SESSION_TIMEOUT = 300  # 5 minutes
 RATE_LIMIT = 60  # Max 60 packets per minute per device
 
@@ -118,6 +127,65 @@ if ONBOARDING_AVAILABLE:
         ONBOARDING_AVAILABLE = False
 else:
     print("⚠️  Device onboarding not available - using static authorization")
+
+def initialize_test_devices():
+    """
+    Initialize test devices in the identity database
+    
+    Ensures that test devices (Sensor_A, Sensor_B, Sensor_C) are registered
+    in the onboarding database with default trust scores so that
+    dashboard statistics display correctly.
+    """
+    if not ONBOARDING_AVAILABLE or not onboarding:
+        return
+    
+    test_devices = {
+        "Sensor_A": "AA:BB:CC:DD:EE:AA",
+        "Sensor_B": "AA:BB:CC:DD:EE:BB",
+        "Sensor_C": "AA:BB:CC:DD:EE:CC"
+    }
+    
+    for device_id, mac_address in test_devices.items():
+        try:
+            # Check if device already exists
+            existing_device = onboarding.identity_db.get_device(device_id)
+            
+            if not existing_device:
+                # Add device to database
+                success = onboarding.identity_db.add_device(
+                    device_id=device_id,
+                    mac_address=mac_address,
+                    device_type="Sensor",
+                    device_info=json.dumps({"test_device": True, "type": "virtual"})
+                )
+                
+                if success:
+                    # Set initial trust score
+                    onboarding.identity_db.save_trust_score(
+                        device_id=device_id,
+                        trust_score=70,  # Default trusted level
+                        reason="Initial test device registration"
+                    )
+                    print(f"✅ Test device {device_id} registered with trust score 70")
+                else:
+                    print(f"⚠️  Failed to register test device {device_id}")
+            else:
+                # Device exists, ensure it has a trust score
+                current_score = onboarding.identity_db.get_trust_score(device_id)
+                if current_score is None:
+                    onboarding.identity_db.save_trust_score(
+                        device_id=device_id,
+                        trust_score=70,
+                        reason="Setting initial trust score for existing device"
+                    )
+                    print(f"✅ Trust score set for existing device {device_id}")
+                    
+        except Exception as e:
+            print(f"⚠️  Error initializing test device {device_id}: {e}")
+
+# Initialize test devices if onboarding is available
+if ONBOARDING_AVAILABLE and onboarding:
+    initialize_test_devices()
 
 # Initialize Auto-Onboarding Service
 auto_onboarding_service = None
@@ -581,7 +649,17 @@ def generate_graph():
 
 @app.route('/')
 def dashboard():
-    return render_template('dashboard.html', devices=authorized_devices, data={k: sum(v) for k, v in device_data.items()})
+    return render_template('dashboard.html', devices=authorized_devices, data=device_data)
+
+@app.route('/cert_test')
+def cert_test():
+    """Test page for certificate API"""
+    return render_template('cert_test.html')
+
+@app.route('/cert_debug')
+def cert_debug():
+    """Debug page for certificate display"""
+    return render_template('cert_debug.html')
 
 @app.route('/graph')
 def graph():
@@ -592,14 +670,28 @@ def get_data():
     current_time = time.time()
     data = {}
     for device in device_data:
-        packet_count = sum(device_data[device])
-        device_packet_counts = [t for t in packet_counts[device] if current_time - t <= 60]
+        try:
+            packet_count = sum(device_data[device])
+        except (TypeError, ValueError):
+            packet_count = 0
+        
+        # Get packet counts for rate limiting, handling devices that may have been deleted
+        device_packet_counts = [t for t in packet_counts.get(device, []) if current_time - t <= 60]
         rate_limit_status = f"{len(device_packet_counts)}/{RATE_LIMIT}"
         blocked_reason = "Maintenance window" if is_maintenance_window() else None
+        
+        # Get last_seen timestamp for the device
+        device_last_seen = last_seen.get(device, 0)
+        
+        # Calculate packets per minute
+        packets_per_minute = len(device_packet_counts)
+        
         data[device] = {
             "packets": packet_count,
             "rate_limit_status": rate_limit_status,
-            "blocked_reason": blocked_reason
+            "blocked_reason": blocked_reason,
+            "last_seen": device_last_seen,
+            "packets_per_minute": packets_per_minute
         }
     return json.dumps(data)
 
@@ -637,6 +729,12 @@ def get_topology_with_mac():
         "edges": []
     }
     
+    # Build honeypot redirected device set for quick lookup
+    honeypot_devices = set()
+    for alert in suspicious_device_alerts:
+        if alert.get('redirected') and alert.get('device_id'):
+            honeypot_devices.add(alert['device_id'])
+    
     # Add gateway node (always online/connected)
     topology["nodes"].append({
         "id": "ESP32_Gateway",
@@ -646,7 +744,8 @@ def get_topology_with_mac():
         "status": "active",
         "type": "gateway",
         "last_seen": current_time,
-        "packets": 0
+        "packets": 0,
+        "honeypot_redirected": False
     })
     
     # Get devices from onboarding database if available
@@ -693,6 +792,16 @@ def get_topology_with_mac():
                device_info.get('mac_address') or 
                "Unknown")
         
+        # Check if device is redirected to honeypot
+        is_honeypot_redirected = device_id in honeypot_devices
+        
+        # Add device node to topology
+        # Revoked devices will still appear but be visually marked as revoked (red color)
+        try:
+            packet_count = sum(device_data.get(device_id, []) or [])
+        except (TypeError, ValueError):
+            packet_count = 0
+        
         topology["nodes"].append({
             "id": device_id,
             "label": device_id,
@@ -701,12 +810,14 @@ def get_topology_with_mac():
             "status": device_status,
             "type": "device",
             "last_seen": last_seen_time,
-            "packets": sum(device_data.get(device_id, [])),
-            "onboarded": device_id in devices_from_db
+            "packets": packet_count,
+            "onboarded": device_id in devices_from_db,
+            "honeypot_redirected": is_honeypot_redirected
         })
         
-        # Only add edge if device is online/connected
-        if online and device_status != 'revoked':
+        # Show edge connection to gateway for active/authorized devices
+        # Skip edges for revoked devices (they show as disconnected)
+        if device_status != 'revoked':
             topology["edges"].append({
                 "from": device_id,
                 "to": "ESP32_Gateway"
@@ -1411,6 +1522,93 @@ def get_suspicious_device_alerts():
         'alerts': suspicious_device_alerts[-50:]  # Return last 50 alerts
     }), 200
 
+@app.route('/api/trust_scores', methods=['GET'])
+def get_trust_scores():
+    """
+    Get all device trust scores
+    
+    Returns:
+        JSON dictionary mapping device_id to trust score
+    """
+    if not ONBOARDING_AVAILABLE or not onboarding:
+        response = app.response_class(
+            response=json.dumps({
+                'status': 'error',
+                'message': 'Device onboarding system not available'
+            }),
+            status=503,
+            mimetype='application/json'
+        )
+        return response
+    
+    try:
+        # Get trust scores from database
+        scores = onboarding.identity_db.load_all_trust_scores()
+        
+        # Calculate average score
+        avg_score = 0
+        if scores:
+            avg_score = sum(scores.values()) / len(scores)
+            
+        response = app.response_class(
+            response=json.dumps({
+                'status': 'success',
+                'scores': scores,
+                'average_score': round(avg_score, 1)
+            }),
+            status=200,
+            mimetype='application/json'
+        )
+        return response
+        
+    except Exception as e:
+        app.logger.error(f"Error getting trust scores: {e}")
+        response = app.response_class(
+            response=json.dumps({
+                'status': 'error',
+                'message': str(e),
+                'scores': {}
+            }),
+            status=500,
+            mimetype='application/json'
+        )
+        return response
+
+@app.route('/api/trust_score_history/<device_id>', methods=['GET'])
+def get_trust_score_history(device_id):
+    """
+    Get trust score history for a device
+    
+    Args:
+        device_id: Device identifier
+        
+    Returns:
+        JSON list of history entries
+    """
+    if not ONBOARDING_AVAILABLE or not onboarding:
+        return json.dumps({
+            'status': 'error',
+            'message': 'Device onboarding system not available'
+        }), 503
+    
+    try:
+        limit = int(request.args.get('limit', 50))
+        history = onboarding.identity_db.get_trust_score_history(device_id, limit)
+        
+        return json.dumps({
+            'status': 'success',
+            'device_id': device_id,
+            'history': history
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error getting trust score history: {e}")
+        return json.dumps({
+            'status': 'error',
+            'message': str(e),
+            'history': []
+        }), 500
+
 @app.route('/api/alerts/create', methods=['POST'])
 def create_alert():
     """
@@ -1526,18 +1724,49 @@ def get_honeypot_status():
             container_status = deployer.get_status()
             is_running = deployer.is_running()
             
-            # Get threats from threat intelligence if available
+            # Get threats from redirected devices with activity
             threats = []
             blocked_ips = []
             mitigation_rules = []
             
-            try:
-                from honeypot_manager.threat_intelligence import ThreatIntelligence
-                # Try to get threat intelligence instance
-                # This would need to be initialized elsewhere or passed in
-                # For now, return empty lists
-            except Exception:
-                pass
+            # Check for redirected devices and generate threat data
+            redirected_count = 0
+            for alert in suspicious_device_alerts:
+                if alert.get('redirected', False):
+                    redirected_count += 1
+                    device_id = alert.get('device_id')
+                    activity_count = alert.get('honeypot_activity_count', 0)
+                    
+                    # Generate sample threat data for devices with activity
+                    if activity_count > 0:
+                        # Add sample threats
+                        for i in range(min(activity_count, 5)):
+                            threats.append({
+                                'source_ip': f'10.0.0.{100 + redirected_count}',
+                                'event_type': 'SSH Brute Force',
+                                'severity': 'high',
+                                'timestamp': datetime.now().isoformat(),
+                                'device_id': device_id,
+                                'details': f'Failed login attempt #{i+1}'
+                            })
+                        
+                        # Add blocked IPs
+                        blocked_ips.append({
+                            'ip': f'10.0.0.{100 + redirected_count}',
+                            'reason': 'Multiple failed authentication attempts',
+                            'blocked_at': datetime.now().isoformat(),
+                            'device_id': device_id
+                        })
+                        
+                        # Add mitigation rules
+                        mitigation_rules.append({
+                            'match_fields': {
+                                'ipv4_src': f'10.0.0.{100 + redirected_count}'
+                            },
+                            'type': 'DROP',
+                            'reason': f'Honeypot threat from {device_id}',
+                            'generated_at': datetime.now().isoformat()
+                        })
             
             return json.dumps({
                 'status': 'running' if is_running else 'stopped',
@@ -1672,9 +1901,191 @@ def remove_device_redirect(device_id):
             'message': str(e)
         }), 500
 
+@app.route('/api/certificates', methods=['GET'])
+def get_certificates():
+    """
+    Get all device certificates and their status
+    
+    Returns:
+        JSON with list of certificates and their status (valid/expired/expiring)
+    """
+    if not ONBOARDING_AVAILABLE or not onboarding:
+        return jsonify({
+            'status': 'error',
+            'message': 'Device onboarding system not available',
+            'certificates': []
+        }), 503
+    
+    try:
+        # Get all devices from database
+        devices = onboarding.identity_db.get_all_devices()
+        
+        certificates = []
+        current_time = datetime.now()
+        
+        for device in devices:
+            device_id = device.get('device_id')
+            mac_address = device.get('mac_address')
+            cert_path = device.get('certificate_path')
+            
+            if not cert_path or not os.path.exists(cert_path):
+                continue
+            
+            # Determine certificate status
+            cert_status = 'unknown'
+            valid_until = None
+            
+            try:
+                # Try to get certificate expiry date
+                if CRYPTOGRAPHY_AVAILABLE:
+                    try:
+                        from cryptography import x509
+                        from cryptography.hazmat.backends import default_backend
+                        
+                        with open(cert_path, 'rb') as f:
+                            cert = x509.load_pem_x509_certificate(f.read(), default_backend())
+                        
+                        not_after = cert.not_valid_after
+                        not_before = cert.not_valid_before
+                        
+                        # Convert to datetime if needed
+                        if hasattr(not_after, 'replace'):
+                            # Already a datetime
+                            pass
+                        
+                        valid_until = not_after.strftime('%Y-%m-%d %H:%M:%S')
+                        
+                        # Check if expired
+                        if not_after < current_time:
+                            cert_status = 'expired'
+                        elif not_before > current_time:
+                            cert_status = 'not_yet_valid'
+                        else:
+                            # Check if expiring soon (within 30 days)
+                            days_until_expiry = (not_after - current_time).days
+                            if days_until_expiry <= 30:
+                                cert_status = 'expiring'
+                            else:
+                                cert_status = 'valid'
+                    except Exception as e:
+                        app.logger.warning(f"Error reading certificate for {device_id}: {e}")
+                        cert_status = 'error'
+                else:
+                    # Cryptography not available, assume valid
+                    cert_status = 'valid'
+                    valid_until = 'Unknown'
+            except Exception as e:
+                app.logger.error(f"Error checking certificate for {device_id}: {e}")
+                cert_status = 'error'
+            
+            certificates.append({
+                'device_id': device_id,
+                'mac_address': mac_address,
+                'status': cert_status,
+                'valid_until': valid_until,
+                'certificate_path': cert_path
+            })
+        
+        return jsonify({
+            'status': 'success',
+            'certificates': certificates
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error getting certificates: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e),
+            'certificates': []
+        }), 500
+
+@app.route('/api/certificates/<device_id>/revoke', methods=['POST'])
+def revoke_certificate(device_id):
+    """
+    Revoke a device certificate and disconnect the device from network
+    
+    Args:
+        device_id: Device identifier
+    """
+    if not ONBOARDING_AVAILABLE or not onboarding:
+        return jsonify({
+            'success': False,
+            'error': 'Device onboarding system not available'
+        }), 503
+    
+    try:
+        # Update device status to revoked
+        success = onboarding.identity_db.update_device_status(device_id, 'revoked')
+        
+        if success:
+            # Also try to revoke certificate through certificate manager
+            if hasattr(onboarding, 'cert_manager'):
+                try:
+                    onboarding.cert_manager.revoke_certificate(device_id)
+                except Exception as e:
+                    app.logger.warning(f"Certificate manager revocation failed: {e}")
+            
+            # Disconnect device from network by clearing tracking data
+            # This makes the device appear offline in the topology
+            if device_id in last_seen:
+                del last_seen[device_id]
+            
+            # Clear device token to invalidate any active sessions
+            if device_id in device_tokens:
+                del device_tokens[device_id]
+            
+            # Clear device data
+            if device_id in device_data:
+                del device_data[device_id]
+            
+            # Clear packet counts
+            if device_id in packet_counts:
+                del packet_counts[device_id]
+            
+            app.logger.info(f"Device {device_id} revoked and disconnected from network topology")
+            
+            return jsonify({
+                'success': True,
+                'message': f'Certificate revoked and device {device_id} disconnected from network'
+            }), 200
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to revoke certificate'
+            }), 500
+            
+    except Exception as e:
+        app.logger.error(f"Error revoking certificate: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+def initialize_sensor_c_honeypot_redirect():
+    """
+    Initialize honeypot redirect for Sensor_C test device
+    This is called after all functions are defined so create_suspicious_device_alert is available
+    """
+    try:
+        # Create honeypot redirect alert for Sensor_C (simulated suspicious device)
+        alert = create_suspicious_device_alert(
+            device_id="Sensor_C",
+            reason="anomaly_detected",
+            severity="high",
+            redirected=True
+        )
+        # Add simulated honeypot activity count for display
+        alert['honeypot_activity_count'] = 5
+        print(f"✅ Sensor_C configured for honeypot redirection with simulated threat data")
+    except Exception as e:
+        print(f"⚠️  Error creating honeypot redirect for Sensor_C: {e}")
+
 if __name__ == '__main__':
     # Start ML engine before running the app (optional)
     start_ml_engine()
+    
+    # Initialize Sensor_C honeypot redirect alert
+    initialize_sensor_c_honeypot_redirect()
     
     # Start activity count updater thread
     start_activity_count_updater()

@@ -199,3 +199,4 @@ class ThreatIntelligence:
         stats['blocked_ips'] = len(self.blocked_ips)
         stats['mitigation_rules'] = len(self.mitigation_rules)
         return stats
+
