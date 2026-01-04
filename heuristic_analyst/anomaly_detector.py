@@ -257,4 +257,3 @@ class AnomalyDetector:
             List of alert dictionaries
         """
         return self.alert_history[-limit:]
-
