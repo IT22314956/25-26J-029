@@ -5,7 +5,7 @@ Advanced IoT Security Framework with Software-Defined Networking
 
 import matplotlib
 matplotlib.use('Agg')
-from flask import Flask, request, render_template, send_file, jsonify
+from flask import Flask, request, render_template, send_file, jsonify, redirect, url_for
 import json
 import matplotlib.pyplot as plt
 import io
@@ -16,6 +16,8 @@ import random
 import threading
 import os
 import logging
+import subprocess
+import sys
 
 # Try to import DeviceOnboarding, but make it optional
 try:
@@ -172,13 +174,32 @@ def initialize_test_devices():
             else:
                 # Device exists, ensure it has a trust score
                 current_score = onboarding.identity_db.get_trust_score(device_id)
-                if current_score is None:
+                
+                # Force update Sensor_A and Sensor_B to 70 if they are not 70
+                if device_id in ["Sensor_A", "Sensor_B"] and current_score != 70:
+                    onboarding.identity_db.save_trust_score(
+                        device_id=device_id,
+                        trust_score=70,
+                        reason="Enforcing trust score for test device"
+                    )
+                    print(f"✅ Trust score updated to 70 for device {device_id}")
+                elif current_score is None:
                     onboarding.identity_db.save_trust_score(
                         device_id=device_id,
                         trust_score=70,
                         reason="Setting initial trust score for existing device"
                     )
                     print(f"✅ Trust score set for existing device {device_id}")
+                
+
+                
+                # Sync database status with authorized_devices dict
+                # If device is in authorized_devices as True, ensure DB status is 'active'
+                if device_id in authorized_devices and authorized_devices[device_id]:
+                    db_status = existing_device.get('status', '')
+                    if db_status == 'revoked':
+                        onboarding.identity_db.update_device_status(device_id, 'active')
+                        print(f"✅ Device {device_id} status synced to 'active' (was revoked)")
                     
         except Exception as e:
             print(f"⚠️  Error initializing test device {device_id}: {e}")
@@ -695,14 +716,75 @@ def get_data():
         }
     return json.dumps(data)
 
+def hard_reauthorize_device(device_id):
+    """
+    Fully restore a revoked device so it works immediately
+    """
+    now = time.time()
+
+    # 1. Mark authorized in memory
+    authorized_devices[device_id] = True
+
+    # 2. Restore DB status
+    if ONBOARDING_AVAILABLE and onboarding:
+        try:
+            onboarding.identity_db.update_device_status(device_id, 'active')
+        except Exception as e:
+            app.logger.error(f"DB reauth failed for {device_id}: {e}")
+
+    # 3. Reset runtime state
+    device_tokens.pop(device_id, None)
+    packet_counts[device_id] = []
+    device_data[device_id] = []
+    last_seen[device_id] = now
+
+    # 4. Issue fresh token
+    new_token = str(uuid.uuid4())
+    device_tokens[device_id] = {
+        "token": new_token,
+        "last_activity": now
+    }
+
+    app.logger.info(f"🔥 Device {device_id} fully re-authorized with fresh session")
+    return new_token
+
 @app.route('/update', methods=['POST'])
 def update_auth():
     device_id = request.form['device_id']
     action = request.form['action']
-    authorized_devices[device_id] = (action == 'authorize')
-    if action == 'revoke' and device_id in device_tokens:
-        device_tokens.pop(device_id)
-    return dashboard()
+    
+    if action == 'authorize':
+        new_token = hard_reauthorize_device(device_id)
+        
+        # Automatically run mininet_topology.py
+        try:
+            curr_dir = os.path.dirname(os.path.abspath(__file__))
+            script_path = os.path.join(curr_dir, 'mininet_topology.py')
+            # Run in background
+            subprocess.Popen([sys.executable, script_path], cwd=curr_dir)
+            app.logger.info(f"🚀 Automatically started mininet_topology.py triggered by re-auth of {device_id}")
+        except Exception as e:
+            app.logger.error(f"Failed to start mininet_topology.py: {e}")
+
+        except Exception as e:
+            app.logger.error(f"Failed to start mininet_topology.py: {e}")
+
+        return redirect(url_for('dashboard'))
+
+    elif action == 'revoke':
+        authorized_devices[device_id] = False
+
+        if ONBOARDING_AVAILABLE and onboarding:
+            onboarding.identity_db.update_device_status(device_id, 'revoked')
+
+        device_tokens.pop(device_id, None)
+        packet_counts.pop(device_id, None)
+        device_data.pop(device_id, None)
+        last_seen.pop(device_id, None)
+
+        app.logger.info(f"🛑 Device {device_id} hard-revoked")
+    
+    return redirect(url_for('dashboard'))
 
 @app.route('/update_policy', methods=['POST'])
 def update_policy():
@@ -785,7 +867,15 @@ def get_topology_with_mac():
         
         # Get device info from database if available
         device_info = devices_from_db.get(device_id, {})
-        device_status = device_info.get('status', 'active' if online else 'inactive')
+        # Set status based on online state - offline devices should show as inactive
+        # unless they are explicitly revoked
+        db_status = device_info.get('status', None)
+        if db_status == 'revoked':
+            device_status = 'revoked'
+        elif online:
+            device_status = db_status if db_status else 'active'
+        else:
+            device_status = 'inactive'
         
         # Get MAC address (from database, mac_addresses dict, or default)
         mac = (mac_addresses.get(device_id) or 
@@ -815,9 +905,10 @@ def get_topology_with_mac():
             "honeypot_redirected": is_honeypot_redirected
         })
         
-        # Show edge connection to gateway for active/authorized devices
-        # Skip edges for revoked devices (they show as disconnected)
-        if device_status != 'revoked':
+        # Show edge connection to gateway for devices that are:
+        # 1. Not revoked AND
+        # 2. Currently online (seen in last 10 seconds)
+        if device_status != 'revoked' and online:
             topology["edges"].append({
                 "from": device_id,
                 "to": "ESP32_Gateway"
@@ -2041,6 +2132,9 @@ def revoke_certificate(device_id):
             # Clear packet counts
             if device_id in packet_counts:
                 del packet_counts[device_id]
+            
+            # Update in-memory authorization status so Devices tab shows correct button
+            authorized_devices[device_id] = False
             
             app.logger.info(f"Device {device_id} revoked and disconnected from network topology")
             
