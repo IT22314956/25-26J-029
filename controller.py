@@ -1,3 +1,9 @@
+def get_pending_manager():
+    """Return a pending device manager if available."""
+    if auto_onboarding_service and hasattr(auto_onboarding_service, "pending_manager"):
+        return auto_onboarding_service.pending_manager
+    return pending_manager
+
 """
 IoT Security Framework Controller
 Advanced IoT Security Framework with Software-Defined Networking
@@ -5,7 +11,7 @@ Advanced IoT Security Framework with Software-Defined Networking
 
 import matplotlib
 matplotlib.use('Agg')
-from flask import Flask, request, render_template, send_file, jsonify, redirect, url_for
+from flask import Flask, request, render_template, send_file, jsonify
 import json
 import matplotlib.pyplot as plt
 import io
@@ -16,8 +22,7 @@ import random
 import threading
 import os
 import logging
-import subprocess
-import sys
+import sqlite3
 
 # Try to import DeviceOnboarding, but make it optional
 try:
@@ -32,11 +37,15 @@ except ImportError as e:
 # Try to import Auto-Onboarding Service, but make it optional
 try:
     from network_monitor.auto_onboarding_service import AutoOnboardingService
+    from network_monitor.pending_devices import PendingDeviceManager
     AUTO_ONBOARDING_AVAILABLE = True
+    PENDING_MANAGER_AVAILABLE = True
 except ImportError as e:
     AUTO_ONBOARDING_AVAILABLE = False
+    PENDING_MANAGER_AVAILABLE = False
     print(f"⚠️  Auto-onboarding service not available: {e}")
     AutoOnboardingService = None
+    PendingDeviceManager = None
 
 # Try to import ML engine, but make it optional
 try:
@@ -59,35 +68,24 @@ except ImportError as e:
     def get_ml_engine():
         return None
 
-# Try to import cryptography for certificate validation
-try:
-    from cryptography import x509
-    from cryptography.hazmat.backends import default_backend
-    CRYPTOGRAPHY_AVAILABLE = True
-except ImportError:
-    CRYPTOGRAPHY_AVAILABLE = False
-    print("⚠️  cryptography module not available. Certificate expiry checks will be limited.")
-
-
 app = Flask(__name__)
 
 # Device authorization (static for now, can be dynamic)
-authorized_devices = {
-    "Sensor_A": True,
-    "Sensor_B": True
-}
-device_data = {"Sensor_A": [], "Sensor_B": []}
+authorized_devices = {}
+device_data = {}
 timestamps = []
-last_seen = {"Sensor_A": 0, "Sensor_B": 0}
+last_seen = {}
 device_tokens = {}  # {device_id: {"token": token, "last_activity": timestamp}}
-packet_counts = {"Sensor_A": [], "Sensor_B": []}  # For rate limiting
+packet_counts = {}  # For rate limiting
 SESSION_TIMEOUT = 300  # 5 minutes
 RATE_LIMIT = 60  # Max 60 packets per minute per device
 
+# Track failed token requests for manual approval
+failed_token_requests = {}  # {device_id: {"mac_address": mac, "last_request": timestamp, "count": count}}
+
 # Store MAC addresses dynamically
 mac_addresses = {
-    "ESP32_Gateway": "A0:B1:C2:D3:E4:F5"  # Hardcoded for gateway
-    # ESP32 devices will be populated dynamically
+    # MAC addresses will be populated dynamically as devices connect
 }
 
 # SDN Policies
@@ -109,10 +107,14 @@ sdn_metrics = {
 
 # Suspicious device alerts for dashboard
 suspicious_device_alerts = []  # List of alert dictionaries
+_last_trust_reduction = {}  # {device_id: timestamp} — rate-limit trust score hits
 
 # Initialize ML Security Engine
 ml_engine = None
 ml_monitoring_active = False
+
+# Security flag: disallow insecure auto-authorization unless explicitly enabled
+ALLOW_INSECURE_AUTO_AUTH = os.getenv("ALLOW_INSECURE_AUTO_AUTH", "false").lower() == "true"
 
 # Initialize Device Onboarding System
 onboarding = None
@@ -121,110 +123,111 @@ if ONBOARDING_AVAILABLE:
         certs_dir = os.path.join(os.path.dirname(__file__), 'certs')
         db_path = os.path.join(os.path.dirname(__file__), 'identity.db')
         onboarding = DeviceOnboarding(certs_dir=certs_dir, db_path=db_path)
-        print("✅ Device onboarding system initialized")
+        print(" [OK] Device onboarding system initialized")
     except Exception as e:
-        print(f"⚠️  Failed to initialize device onboarding: {e}")
+        print(f" [FAIL] Failed to initialize device onboarding: {e}")
         print("   System will use static device authorization")
         onboarding = None
         ONBOARDING_AVAILABLE = False
 else:
-    print("⚠️  Device onboarding not available - using static authorization")
+    print(" [WARN] Device onboarding not available - using static authorization")
 
-def initialize_test_devices():
-    """
-    Initialize test devices in the identity database
-    
-    Ensures that test devices (Sensor_A, Sensor_B, Sensor_C) are registered
-    in the onboarding database with default trust scores so that
-    dashboard statistics display correctly.
-    """
-    if not ONBOARDING_AVAILABLE or not onboarding:
-        return
-    
-    test_devices = {
-        "Sensor_A": "AA:BB:CC:DD:EE:AA",
-        "Sensor_B": "AA:BB:CC:DD:EE:BB",
-        "Sensor_C": "AA:BB:CC:DD:EE:CC"
-    }
-    
-    for device_id, mac_address in test_devices.items():
-        try:
-            # Check if device already exists
-            existing_device = onboarding.identity_db.get_device(device_id)
-            
-            if not existing_device:
-                # Add device to database
-                success = onboarding.identity_db.add_device(
-                    device_id=device_id,
-                    mac_address=mac_address,
-                    device_type="Sensor",
-                    device_info=json.dumps({"test_device": True, "type": "virtual"})
-                )
-                
-                if success:
-                    # Set initial trust score
-                    onboarding.identity_db.save_trust_score(
-                        device_id=device_id,
-                        trust_score=70,  # Default trusted level
-                        reason="Initial test device registration"
-                    )
-                    print(f"✅ Test device {device_id} registered with trust score 70")
-                else:
-                    print(f"⚠️  Failed to register test device {device_id}")
-            else:
-                # Device exists, ensure it has a trust score
-                current_score = onboarding.identity_db.get_trust_score(device_id)
-                
-                # Force update Sensor_A and Sensor_B to 70 if they are not 70
-                if device_id in ["Sensor_A", "Sensor_B"] and current_score != 70:
-                    onboarding.identity_db.save_trust_score(
-                        device_id=device_id,
-                        trust_score=70,
-                        reason="Enforcing trust score for test device"
-                    )
-                    print(f"✅ Trust score updated to 70 for device {device_id}")
-                elif current_score is None:
-                    onboarding.identity_db.save_trust_score(
-                        device_id=device_id,
-                        trust_score=70,
-                        reason="Setting initial trust score for existing device"
-                    )
-                    print(f"✅ Trust score set for existing device {device_id}")
-                
-
-                
-                # Sync database status with authorized_devices dict
-                # If device is in authorized_devices as True, ensure DB status is 'active'
-                if device_id in authorized_devices and authorized_devices[device_id]:
-                    db_status = existing_device.get('status', '')
-                    if db_status == 'revoked':
-                        onboarding.identity_db.update_device_status(device_id, 'active')
-                        print(f"✅ Device {device_id} status synced to 'active' (was revoked)")
-                    
-        except Exception as e:
-            print(f"⚠️  Error initializing test device {device_id}: {e}")
-
-# Initialize test devices if onboarding is available
+# Hydrate authorized_devices from database if available (Persistence Fix)
 if ONBOARDING_AVAILABLE and onboarding:
-    initialize_test_devices()
+    try:
+        print(" [INFO] Hydrating authorized devices from database...")
+        stored_devices = onboarding.identity_db.get_all_devices()
+        count = 0
+        for device in stored_devices:
+            # If device is active or has a valid certificate, authorized it
+            if device.get('status') == 'active' or device.get('certificate_path'):
+                device_id = device['device_id']
+                authorized_devices[device_id] = True
+                
+                # Restore MAC address
+                if device.get('mac_address'):
+                    mac_addresses[device_id] = device['mac_address']
+                
+                # Restore last_seen if available (to prevent immediate timeout)
+                if device.get('last_seen'):
+                    try:
+                        # Handle both string (ISO) and float/int timestamps
+                        ls_val = device['last_seen']
+                        if isinstance(ls_val, str):
+                            import datetime as dt_module
+                            # Naive parse just for restoration
+                            ls_time = time.mktime(dt_module.datetime.fromisoformat(ls_val.replace('Z', '+00:00')).timetuple())
+                            last_seen[device_id] = ls_time
+                        else:
+                            last_seen[device_id] = float(ls_val)
+                    except Exception:
+                        last_seen[device_id] = time.time()
+                
+                # Initialize data structures
+                if device_id not in device_data:
+                    device_data[device_id] = []
+                if device_id not in packet_counts:
+                    packet_counts[device_id] = []
+                    
+                count += 1
+        print(f" [OK] Restored {count} authorized devices from persistent storage")
+    except Exception as e:
+        print(f" [WARN] Failed to hydrate authorized devices: {e}")
 
 # Initialize Auto-Onboarding Service
 auto_onboarding_service = None
-if AUTO_ONBOARDING_AVAILABLE and onboarding:
+pending_manager = None
+if AUTO_ONBOARDING_AVAILABLE:
     try:
         auto_onboarding_service = AutoOnboardingService(
-            onboarding_module=onboarding,
+            onboarding_module=onboarding,  # may be None; service still manages pending list
             identity_db=onboarding.identity_db if onboarding else None
         )
+        pending_manager = auto_onboarding_service.pending_manager
         # Start the service
         auto_onboarding_service.start()
-        print("✅ Auto-onboarding service initialized and started")
+        print(" [OK] Auto-onboarding service initialized and started")
     except Exception as e:
-        print(f"⚠️  Failed to initialize auto-onboarding service: {e}")
+        print(f" [WARN] Failed to initialize auto-onboarding service: {e}")
         auto_onboarding_service = None
+        if PENDING_MANAGER_AVAILABLE:
+            try:
+                pending_manager = PendingDeviceManager()
+                print(" [INFO] Fallback pending device manager initialized")
+            except Exception as pe:
+                print(f" [WARN] Failed to initialize fallback pending device manager: {pe}")
+                pending_manager = None
         AUTO_ONBOARDING_AVAILABLE = False
-elif AUTO_ONBOARDING_AVAILABLE:
-    print("⚠️  Auto-onboarding service requires onboarding module")
+elif PENDING_MANAGER_AVAILABLE:
+    try:
+        pending_manager = PendingDeviceManager()
+        print("ℹ️  Pending device manager initialized (no auto-onboarding service)")
+    except Exception as pe:
+        print(f"⚠️  Failed to initialize pending device manager: {pe}")
+
+# Initialize Trust Scorer for live trust score management
+try:
+    from trust_evaluator.trust_scorer import TrustScorer
+    trust_scorer = TrustScorer(
+        initial_score=70,
+        identity_db=onboarding.identity_db if (ONBOARDING_AVAILABLE and onboarding) else None
+    )
+    TRUST_SCORER_AVAILABLE = True
+    print(" [OK] Trust Scorer initialized")
+except Exception as e:
+    trust_scorer = None
+    TRUST_SCORER_AVAILABLE = False
+    print(f"⚠️  Trust Scorer not available: {e}")
+
+# Hydrate trust scores for all known authorized devices at startup
+if TRUST_SCORER_AVAILABLE and trust_scorer:
+    _hydrated_count = 0
+    for _dev_id in list(authorized_devices.keys()):
+        if trust_scorer.get_trust_score(_dev_id) is None:
+            trust_scorer.initialize_device(_dev_id)
+            _hydrated_count += 1
+    if _hydrated_count > 0:
+        print(f" [OK] Trust scores initialized for {_hydrated_count} authorized devices")
 
 
 @app.route('/ml/health')
@@ -294,7 +297,7 @@ def onboard_device():
     
     Request JSON:
     {
-        "device_id": "ESP32_2",
+        "device_id": "DEVICE_ID",
         "mac_address": "AA:BB:CC:DD:EE:FF",
         "device_type": "sensor" (optional),
         "device_info": "Additional info" (optional)
@@ -341,6 +344,12 @@ def onboard_device():
             if device_id not in packet_counts:
                 packet_counts[device_id] = []
             
+            # Initialize trust score for newly onboarded device
+            if TRUST_SCORER_AVAILABLE and trust_scorer:
+                if trust_scorer.get_trust_score(device_id) is None:
+                    trust_scorer.initialize_device(device_id)
+                    app.logger.info(f"✅ Trust score initialized for onboarded device {device_id}: 70")
+            
             app.logger.info(f"Device {device_id} onboarded. Profiling will auto-finalize after 5 minutes.")
             return json.dumps(result), 200
         else:
@@ -348,51 +357,6 @@ def onboard_device():
             
     except Exception as e:
         app.logger.error(f"Onboarding error: {str(e)}")
-        return json.dumps({
-            'status': 'error',
-            'message': str(e)
-        }), 500
-
-@app.route('/finalize_onboarding', methods=['POST'])
-def finalize_onboarding():
-    """
-    Manually finalize onboarding for a device (establish baseline and generate policy)
-    
-    Request JSON:
-    {
-        "device_id": "ESP32_2"
-    }
-    
-    Returns:
-        Finalization result with baseline and policy
-    """
-    if not ONBOARDING_AVAILABLE or not onboarding:
-        return json.dumps({
-            'status': 'error',
-            'message': 'Device onboarding system not available'
-        }), 503
-    
-    try:
-        data = request.json
-        device_id = data.get('device_id')
-        
-        if not device_id:
-            return json.dumps({
-                'status': 'error',
-                'message': 'Missing device_id'
-            }), 400
-        
-        # Finalize onboarding
-        result = onboarding.finalize_onboarding(device_id)
-        
-        if result['status'] == 'success':
-            app.logger.info(f"Onboarding finalized for {device_id}. Baseline and policy generated.")
-            return json.dumps(result), 200
-        else:
-            return json.dumps(result), 400
-            
-    except Exception as e:
-        app.logger.error(f"Finalization error: {str(e)}")
         return json.dumps({
             'status': 'error',
             'message': str(e)
@@ -474,15 +438,35 @@ def get_token():
     
     First checks if device is onboarded (certificate-based).
     Falls back to static authorized_devices list for backward compatibility.
+    Auto-authorizes new devices if they provide a valid MAC address.
     """
-    data = request.json
+    try:
+        data = request.json
+        if not data:
+            app.logger.error("Token request: No JSON data received")
+            return json.dumps({'error': 'Invalid JSON data'}), 400
+    except Exception as e:
+        app.logger.error(f"Token request: JSON parsing error: {e}")
+        return json.dumps({'error': 'Invalid JSON format'}), 400
+    
     device_id = data.get('device_id')
     mac_address = data.get('mac_address')  # Get MAC address from request
+    
     if not device_id:
+        app.logger.warning("Token request missing device_id")
+        app.logger.warning(f"Received data: {data}")
         return json.dumps({'error': 'Missing device_id'}), 400
     
-    # Check if device is onboarded (certificate-based authentication)
+    app.logger.info(f"Token request from device_id: {device_id}, MAC: {mac_address}")
+    app.logger.debug(f"Full request data: {data}")
+    
+    # Normalize MAC for downstream checks
+    if isinstance(mac_address, str):
+        mac_address = mac_address.strip()
     device_authorized = False
+    pending_device = None
+    
+    # Check if device is onboarded (certificate-based authentication)
     if ONBOARDING_AVAILABLE and onboarding:
         try:
             device_info = onboarding.get_device_info(device_id)
@@ -493,16 +477,122 @@ def get_token():
                     # Update MAC address from database if not provided
                     if not mac_address and device_info.get('mac_address'):
                         mac_address = device_info['mac_address']
+                    app.logger.info(f"Device {device_id} authorized via certificate-based onboarding")
                 else:
                     app.logger.warning(f"Device {device_id} certificate verification failed")
         except Exception as e:
             app.logger.error(f"Error checking onboarding database: {e}")
     
+    # Check identity database entry if certificate check did not authorize
+    if not device_authorized and ONBOARDING_AVAILABLE and onboarding and hasattr(onboarding, "identity_db"):
+        try:
+            identity_record = onboarding.identity_db.get_device(device_id)
+            if not identity_record and mac_address:
+                identity_record = onboarding.identity_db.get_device_by_mac(mac_address)
+            if identity_record:
+                status = identity_record.get('status', 'active')
+                if status == 'revoked':
+                    app.logger.warning(f"Device {device_id} found in identity DB but status is revoked")
+                else:
+                    device_authorized = True
+                    if not mac_address and identity_record.get('mac_address'):
+                        mac_address = identity_record['mac_address']
+                    app.logger.info(f"Device {device_id} authorized via identity database (status={status})")
+        except Exception as e:
+            app.logger.error(f"Error checking identity database: {e}")
+    
+    # Enforce pending-approval workflow if pending manager is available
+    if not device_authorized:
+        pending_manager = get_pending_manager()
+        if pending_manager:
+            try:
+                if mac_address:
+                    pending_device = pending_manager.get_device_by_mac(mac_address)
+                if pending_device:
+                    pending_status = pending_device.get('status')
+                    if pending_status == pending_manager.STATUS_PENDING:
+                        app.logger.warning(f"Device {device_id} ({mac_address}) is pending approval")
+                        return json.dumps({'error': 'Device pending approval'}), 403
+                    if pending_status == pending_manager.STATUS_REJECTED:
+                        app.logger.warning(f"Device {device_id} ({mac_address}) was rejected")
+                        return json.dumps({'error': 'Device rejected'}), 403
+                    if pending_status in (pending_manager.STATUS_APPROVED, pending_manager.STATUS_ONBOARDED):
+                        device_authorized = True
+                        authorized_devices[device_id] = True
+                        app.logger.info(f"Device {device_id} authorized after approval (status={pending_status})")
+            except Exception as e:
+                app.logger.error(f"Error checking pending device status: {e}")
+    
     # Fallback to static authorized_devices list
     if not device_authorized:
         device_authorized = authorized_devices.get(device_id, False)
+        if device_authorized:
+            app.logger.info(f"Device {device_id} authorized via static authorized_devices list")
+    
+    # Auto-authorize new devices only when explicitly allowed for testing
+    if not device_authorized and ALLOW_INSECURE_AUTO_AUTH:
+        if mac_address:
+            # Validate MAC address format (more flexible check)
+            # ESP8266/ESP32 MAC: "AA:BB:CC:DD:EE:FF" or "AA-BB-CC-DD-EE-FF" or "AABBCCDDEEFF"
+            mac_clean = mac_address.replace(':', '').replace('-', '').replace(' ', '').upper()
+            is_valid_mac = len(mac_clean) == 12 and all(c in '0123456789ABCDEF' for c in mac_clean)
+            
+            if is_valid_mac:
+                # Auto-add to authorized_devices for easy onboarding
+                authorized_devices[device_id] = True
+                device_authorized = True
+                app.logger.info(f"✅ Auto-authorized new device {device_id} with MAC {mac_address}")
+                # Initialize device tracking structures
+                if device_id not in device_data:
+                    device_data[device_id] = []
+                if device_id not in last_seen:
+                    last_seen[device_id] = 0
+                if device_id not in packet_counts:
+                    packet_counts[device_id] = []
+            else:
+                app.logger.warning(f"Invalid MAC address format: {mac_address} (cleaned: {mac_clean}, length: {len(mac_clean)})")
+        else:
+            app.logger.warning(f"⚠️  No MAC address provided for device {device_id}; cannot auto-authorize even though ALLOW_INSECURE_AUTO_AUTH is enabled")
     
     if not device_authorized:
+        # Ensure the device is present in pending list so the dashboard can show it
+        manager = get_pending_manager()
+        if manager and mac_address:
+            try:
+                existing_pending = manager.get_device_by_mac(mac_address)
+                if not existing_pending:
+                    added = manager.add_pending_device(
+                        mac_address=mac_address,
+                        device_id=device_id,
+                        device_type=None,
+                        device_info=None
+                    )
+                    if added:
+                        app.logger.info(f"Device {device_id} ({mac_address}) added to pending approval from token flow")
+                else:
+                    app.logger.debug(f"Device {device_id} ({mac_address}) already present in pending list")
+            except Exception as e:
+                app.logger.error(f"Failed to add device to pending list: {e}")
+
+        # Track failed request for dashboard display
+        if device_id not in failed_token_requests:
+            failed_token_requests[device_id] = {
+                "mac_address": mac_address or "Unknown",
+                "first_request": time.time(),
+                "last_request": time.time(),
+                "count": 1
+            }
+        else:
+            failed_token_requests[device_id]["last_request"] = time.time()
+            failed_token_requests[device_id]["count"] += 1
+            if mac_address and failed_token_requests[device_id]["mac_address"] == "Unknown":
+                failed_token_requests[device_id]["mac_address"] = mac_address
+        
+        app.logger.warning(f"❌ Device {device_id} not authorized - token request rejected")
+        app.logger.warning(f"   MAC provided: {mac_address}")
+        app.logger.warning(f"   MAC type: {type(mac_address)}")
+        app.logger.warning(f"   Device exists in authorized_devices: {device_id in authorized_devices}")
+        app.logger.warning(f"   Current authorized_devices keys: {list(authorized_devices.keys())}")
         return json.dumps({'error': 'Device not authorized'}), 403
     
     # Generate token for authorized device
@@ -511,6 +601,13 @@ def get_token():
     if mac_address:  # Store the MAC address if provided
         mac_addresses[device_id] = mac_address
     
+    # Initialize trust score for authenticated device
+    if TRUST_SCORER_AVAILABLE and trust_scorer:
+        if trust_scorer.get_trust_score(device_id) is None:
+            trust_scorer.initialize_device(device_id)
+            app.logger.info(f"✅ Trust score initialized for authenticated device {device_id}: 70")
+    
+    app.logger.info(f"Token generated successfully for device {device_id}")
     return json.dumps({'token': token})
 
 @app.route('/auth', methods=['POST'])
@@ -605,10 +702,15 @@ def data():
     device_tokens[device_id]["last_activity"] = current_time
     last_seen[device_id] = current_time
     device_data[device_id].append(1)
+    # Ensure device has a trust score entry (catches devices authorized via DB hydration)
+    if TRUST_SCORER_AVAILABLE and trust_scorer:
+        if trust_scorer.get_trust_score(device_id) is None:
+            trust_scorer.initialize_device(device_id)
     if len(timestamps) == 0 or current_time - timestamps[-1] > 1:
         timestamps.append(current_time)
     # Feed packet to ML engine for anomaly detection with device context
     global ml_engine
+    is_attack_detected = False
     try:
         if ml_engine and ml_engine.is_loaded:
             result = ml_engine.predict_attack({
@@ -632,18 +734,51 @@ def data():
             
             # Check if ML detected high-confidence attack and trigger redirection
             if result and result.get('is_attack', False) and result.get('confidence', 0) > 0.8:
-                # High confidence attack detected - create alert
-                severity = 'high' if result.get('confidence', 0) > 0.9 else 'medium'
-                create_suspicious_device_alert(
-                    device_id=device_id,
-                    reason='ml_detection',
-                    severity=severity,
-                    redirected=True
-                )
-                app.logger.warning(f"High-confidence ML attack detected for {device_id}: {result.get('attack_type')}")
+                is_attack_detected = True
+                # Rate-limit trust score reduction: only once per 60s per device
+                last_alert_time = _last_trust_reduction.get(device_id, 0)
+                if current_time - last_alert_time > 60:  # 60s cooldown
+                    severity = 'high' if result.get('confidence', 0) > 0.9 else 'medium'
+                    create_suspicious_device_alert(
+                        device_id=device_id,
+                        reason='ml_detection',
+                        severity=severity,
+                        redirected=True
+                    )
+                    _last_trust_reduction[device_id] = current_time
+                    app.logger.warning(f"High-confidence ML attack detected for {device_id}: {result.get('attack_type')}")
+                else:
+                    # Update detection count on existing alert without reducing trust again
+                    for alert in suspicious_device_alerts:
+                        if alert.get('device_id') == device_id:
+                            alert['detection_count'] = alert.get('detection_count', 0) + 1
+                            break
     except Exception as e:
         # Non-fatal for data ingestion; continue normally
         app.logger.warning(f"ML prediction error (non-fatal): {str(e)}")
+
+    # Trust recovery: normal (non-attack) traffic slowly restores trust score
+    if not is_attack_detected and TRUST_SCORER_AVAILABLE and trust_scorer:
+        try:
+            current_score = trust_scorer.get_trust_score(device_id)
+            
+            # Gradually recover trust for normal traffic
+            if current_score is not None and current_score < trust_scorer.initial_score:
+                trust_scorer.adjust_trust_score(device_id, +2, "Normal behavior observed")
+                current_score = trust_scorer.get_trust_score(device_id)
+            
+            # Always check: if score is >= 30, clear any stale redirected flags
+            # This runs even if the score is already at 70
+            if current_score is not None and current_score >= 30:
+                for alert in suspicious_device_alerts:
+                    if alert.get('device_id') == device_id and alert.get('redirected'):
+                        alert['redirected'] = False
+                        app.logger.info(
+                            f"✅ Device {device_id} trust at {current_score}, "
+                            f"clearing honeypot redirect — device will reconnect on map"
+                        )
+        except Exception:
+            pass
 
     return json.dumps({'status': 'accepted'})
 
@@ -670,17 +805,7 @@ def generate_graph():
 
 @app.route('/')
 def dashboard():
-    return render_template('dashboard.html', devices=authorized_devices, data=device_data)
-
-@app.route('/cert_test')
-def cert_test():
-    """Test page for certificate API"""
-    return render_template('cert_test.html')
-
-@app.route('/cert_debug')
-def cert_debug():
-    """Debug page for certificate display"""
-    return render_template('cert_debug.html')
+    return render_template('dashboard.html', devices=authorized_devices, data={k: sum(v) for k, v in device_data.items()})
 
 @app.route('/graph')
 def graph():
@@ -691,100 +816,233 @@ def get_data():
     current_time = time.time()
     data = {}
     for device in device_data:
-        try:
-            packet_count = sum(device_data[device])
-        except (TypeError, ValueError):
-            packet_count = 0
-        
-        # Get packet counts for rate limiting, handling devices that may have been deleted
-        device_packet_counts = [t for t in packet_counts.get(device, []) if current_time - t <= 60]
+        packet_count = sum(device_data[device])
+        device_packet_counts = [t for t in packet_counts[device] if current_time - t <= 60]
         rate_limit_status = f"{len(device_packet_counts)}/{RATE_LIMIT}"
         blocked_reason = "Maintenance window" if is_maintenance_window() else None
-        
-        # Get last_seen timestamp for the device
-        device_last_seen = last_seen.get(device, 0)
-        
-        # Calculate packets per minute
-        packets_per_minute = len(device_packet_counts)
-        
         data[device] = {
             "packets": packet_count,
             "rate_limit_status": rate_limit_status,
-            "blocked_reason": blocked_reason,
-            "last_seen": device_last_seen,
-            "packets_per_minute": packets_per_minute
+            "blocked_reason": blocked_reason
         }
     return json.dumps(data)
-
-def hard_reauthorize_device(device_id):
-    """
-    Fully restore a revoked device so it works immediately
-    """
-    now = time.time()
-
-    # 1. Mark authorized in memory
-    authorized_devices[device_id] = True
-
-    # 2. Restore DB status
-    if ONBOARDING_AVAILABLE and onboarding:
-        try:
-            onboarding.identity_db.update_device_status(device_id, 'active')
-        except Exception as e:
-            app.logger.error(f"DB reauth failed for {device_id}: {e}")
-
-    # 3. Reset runtime state
-    device_tokens.pop(device_id, None)
-    packet_counts[device_id] = []
-    device_data[device_id] = []
-    last_seen[device_id] = now
-
-    # 4. Issue fresh token
-    new_token = str(uuid.uuid4())
-    device_tokens[device_id] = {
-        "token": new_token,
-        "last_activity": now
-    }
-
-    app.logger.info(f"🔥 Device {device_id} fully re-authorized with fresh session")
-    return new_token
 
 @app.route('/update', methods=['POST'])
 def update_auth():
     device_id = request.form['device_id']
     action = request.form['action']
-    
-    if action == 'authorize':
-        new_token = hard_reauthorize_device(device_id)
-        
-        # Automatically run mininet_topology.py
-        try:
-            curr_dir = os.path.dirname(os.path.abspath(__file__))
-            script_path = os.path.join(curr_dir, 'mininet_topology.py')
-            # Run in background
-            subprocess.Popen([sys.executable, script_path], cwd=curr_dir)
-            app.logger.info(f"🚀 Automatically started mininet_topology.py triggered by re-auth of {device_id}")
-        except Exception as e:
-            app.logger.error(f"Failed to start mininet_topology.py: {e}")
 
-        except Exception as e:
-            app.logger.error(f"Failed to start mininet_topology.py: {e}")
-
-        return redirect(url_for('dashboard'))
-
-    elif action == 'revoke':
+    # Handle revoke as before
+    if action == 'revoke':
         authorized_devices[device_id] = False
+        if device_id in device_tokens:
+            device_tokens.pop(device_id)
+        return dashboard()
 
-        if ONBOARDING_AVAILABLE and onboarding:
-            onboarding.identity_db.update_device_status(device_id, 'revoked')
+    # Handle authorize: mark as authorized and, if possible, drive the
+    # pending/auto-onboarding workflow so this behaves like an admin approval.
+    if action == 'authorize':
+        authorized_devices[device_id] = True
 
-        device_tokens.pop(device_id, None)
-        packet_counts.pop(device_id, None)
-        device_data.pop(device_id, None)
-        last_seen.pop(device_id, None)
+        # Initialize tracking structures so device shows up correctly
+        if device_id not in device_data:
+            device_data[device_id] = []
+        if device_id not in last_seen:
+            last_seen[device_id] = time.time()
+        if device_id not in packet_counts:
+            packet_counts[device_id] = []
 
-        app.logger.info(f"🛑 Device {device_id} hard-revoked")
+        # If we have a pending device entry with this device_id, try to approve
+        # and onboard it just like /api/approve_device does.
+        manager = get_pending_manager()
+        if manager:
+            try:
+                pending_device = None
+                all_devices = manager.get_all_devices()
+                for dev in all_devices:
+                    if dev.get('device_id') == device_id:
+                        pending_device = dev
+                        break
+
+                if pending_device:
+                    mac_address = pending_device.get('mac_address')
+
+                    # Prefer full auto-onboarding service if available
+                    if auto_onboarding_service:
+                        result = auto_onboarding_service.approve_and_onboard(
+                            mac_address,
+                            admin_notes=f"Approved via Devices tab for {device_id}"
+                        )
+                        if result.get('status') == 'success':
+                            # Ensure topology tracking is initialized
+                            if mac_address:
+                                mac_addresses[device_id] = mac_address
+                            app.logger.info(
+                                f"Device {device_id} ({mac_address}) approved via Devices tab and onboarded"
+                            )
+                        else:
+                            app.logger.warning(
+                                f"Devices tab approval for {device_id} failed in auto-onboarding service: "
+                                f"{result.get('message')}"
+                            )
+                    else:
+                        # Fallback: approve in pending DB and manually onboard if module is available
+                        if manager.approve_device(
+                            mac_address,
+                            admin_notes=f"Approved via Devices tab for {device_id}"
+                        ):
+                            if onboarding:
+                                try:
+                                    onboarding_result = onboarding.onboard_device(
+                                        device_id=device_id,
+                                        mac_address=mac_address,
+                                        device_type=pending_device.get('device_type'),
+                                        device_info=pending_device.get('device_info')
+                                    )
+                                    if onboarding_result.get('status') == 'success':
+                                        manager.mark_onboarded(mac_address)
+                                        if mac_address:
+                                            mac_addresses[device_id] = mac_address
+                                        app.logger.info(
+                                            f"Device {device_id} ({mac_address}) approved and onboarded "
+                                            f"via Devices tab (fallback path)"
+                                        )
+                                    else:
+                                        app.logger.warning(
+                                            f"Onboarding failed for {device_id} via Devices tab: "
+                                            f"{onboarding_result.get('message')}"
+                                        )
+                                except Exception as e:
+                                    app.logger.error(
+                                        f"Onboarding error for {device_id} via Devices tab: {e}"
+                                    )
+                        else:
+                            app.logger.warning(
+                                f"Failed to approve pending device {device_id} via Devices tab"
+                            )
+            except Exception as e:
+                app.logger.error(f"Error during Devices tab authorization for {device_id}: {e}")
+
+    return dashboard()
+
+@app.route('/api/failed_token_requests', methods=['GET'])
+def get_failed_token_requests():
+    """
+    Get list of devices that requested tokens but were rejected
     
-    return redirect(url_for('dashboard'))
+    Returns:
+        List of failed token requests for manual approval
+    """
+    try:
+        current_time = time.time()
+        devices = []
+        
+        for device_id, info in failed_token_requests.items():
+            # Only show requests from last 24 hours
+            if current_time - info["last_request"] < 86400:
+                devices.append({
+                    "device_id": device_id,
+                    "mac_address": info["mac_address"],
+                    "first_request": info["first_request"],
+                    "last_request": info["last_request"],
+                    "request_count": info["count"],
+                    "time_since_last": int(current_time - info["last_request"])
+                })
+        
+        # Sort by most recent first
+        devices.sort(key=lambda x: x["last_request"], reverse=True)
+        
+        return json.dumps({
+            'status': 'success',
+            'devices': devices
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error getting failed token requests: {e}")
+        return json.dumps({
+            'status': 'error',
+            'message': str(e),
+            'devices': []
+        }), 500
+
+@app.route('/api/authorize_device', methods=['POST'])
+def api_authorize_device():
+    """
+    API endpoint to authorize or revoke a device
+    
+    Request JSON:
+    {
+        "device_id": "ESP32_5",
+        "mac_address": "AA:BB:CC:DD:EE:FF" (optional),
+        "action": "authorize" or "revoke" (optional, default: "authorize")
+    }
+    
+    Returns:
+        Authorization result
+    """
+    try:
+        data = request.json
+        device_id = data.get('device_id')
+        mac_address = data.get('mac_address')
+        
+        if not device_id:
+            return json.dumps({
+                'status': 'error',
+                'message': 'Missing device_id'
+            }), 400
+        
+        # Check if action is 'revoke'
+        action = data.get('action', 'authorize')
+        
+        if action == 'revoke':
+            # Revoke device authorization
+            authorized_devices[device_id] = False
+            
+            # Remove device tokens
+            if device_id in device_tokens:
+                del device_tokens[device_id]
+            
+            app.logger.info(f"Device {device_id} revoked via API")
+            
+            return json.dumps({
+                'status': 'success',
+                'message': f'Device {device_id} revoked successfully',
+                'device_id': device_id
+            }), 200
+        else:
+            # Authorize device
+            authorized_devices[device_id] = True
+            
+            # Initialize device tracking structures
+            if device_id not in device_data:
+                device_data[device_id] = []
+            if device_id not in last_seen:
+                last_seen[device_id] = time.time()
+            if device_id not in packet_counts:
+                packet_counts[device_id] = []
+            
+            # Store MAC address if provided
+            if mac_address:
+                mac_addresses[device_id] = mac_address
+            
+            # Remove from failed requests if it was there
+            if device_id in failed_token_requests:
+                del failed_token_requests[device_id]
+            
+            app.logger.info(f"Device {device_id} manually authorized via API")
+            
+            return json.dumps({
+                'status': 'success',
+                'message': f'Device {device_id} authorized successfully',
+                'device_id': device_id
+            }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error authorizing device: {e}")
+        return json.dumps({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
 @app.route('/update_policy', methods=['POST'])
 def update_policy():
@@ -811,12 +1069,6 @@ def get_topology_with_mac():
         "edges": []
     }
     
-    # Build honeypot redirected device set for quick lookup
-    honeypot_devices = set()
-    for alert in suspicious_device_alerts:
-        if alert.get('redirected') and alert.get('device_id'):
-            honeypot_devices.add(alert['device_id'])
-    
     # Add gateway node (always online/connected)
     topology["nodes"].append({
         "id": "ESP32_Gateway",
@@ -826,8 +1078,7 @@ def get_topology_with_mac():
         "status": "active",
         "type": "gateway",
         "last_seen": current_time,
-        "packets": 0,
-        "honeypot_redirected": False
+        "packets": 0
     })
     
     # Get devices from onboarding database if available
@@ -843,13 +1094,29 @@ def get_topology_with_mac():
         except Exception as e:
             app.logger.error(f"Error getting devices from database: {e}")
     
-    # Merge database devices with last_seen tracking
-    all_device_ids = set(list(last_seen.keys()) + list(devices_from_db.keys()))
+    # Merge database devices with last_seen tracking and authorized devices
+    # Include authorized devices so they appear in topology even before sending data
+    all_device_ids = set(list(last_seen.keys()) + list(devices_from_db.keys()) + list(authorized_devices.keys()))
     
     # Add ESP32 device nodes and edges to gateway
     for device_id in all_device_ids:
+        # Skip gateway (already added)
+        if device_id == "ESP32_Gateway":
+            continue
+            
         # Get last_seen time (from tracking or database)
         last_seen_time = last_seen.get(device_id, 0)
+        
+        # If device is authorized but not in last_seen, initialize it
+        if device_id in authorized_devices and device_id not in last_seen:
+            last_seen[device_id] = current_time  # Mark as just seen
+            last_seen_time = current_time
+            # Initialize other tracking structures if needed
+            if device_id not in device_data:
+                device_data[device_id] = []
+            if device_id not in packet_counts:
+                packet_counts[device_id] = []
+        
         if device_id in devices_from_db and devices_from_db[device_id].get('last_seen'):
             # Try to parse database timestamp if available
             try:
@@ -857,9 +1124,13 @@ def get_topology_with_mac():
                 if isinstance(db_timestamp, str):
                     from datetime import datetime
                     db_time = datetime.fromisoformat(db_timestamp.replace('Z', '+00:00'))
-                    last_seen_time = db_time.timestamp()
+                    db_last_seen = db_time.timestamp()
                 elif db_timestamp:
-                    last_seen_time = float(db_timestamp)
+                    db_last_seen = float(db_timestamp)
+                else:
+                    db_last_seen = 0
+                # Use the MOST RECENT timestamp — don't let stale DB overwrite live data
+                last_seen_time = max(last_seen_time, db_last_seen)
             except:
                 pass
         
@@ -867,30 +1138,29 @@ def get_topology_with_mac():
         
         # Get device info from database if available
         device_info = devices_from_db.get(device_id, {})
-        # Set status based on online state - offline devices should show as inactive
-        # unless they are explicitly revoked
-        db_status = device_info.get('status', None)
-        if db_status == 'revoked':
-            device_status = 'revoked'
-        elif online:
-            device_status = db_status if db_status else 'active'
-        else:
-            device_status = 'inactive'
+        # Use live online check as primary — DB status stays 'active' forever
+        db_status = device_info.get('status', '')
+        device_status = 'active' if online else ('revoked' if db_status == 'revoked' else 'inactive')
         
         # Get MAC address (from database, mac_addresses dict, or default)
         mac = (mac_addresses.get(device_id) or 
                device_info.get('mac_address') or 
                "Unknown")
         
-        # Check if device is redirected to honeypot
-        is_honeypot_redirected = device_id in honeypot_devices
+        # Get trust score and level for this device
+        node_trust_score = 70  # default
+        node_trust_level = 'trusted'
+        if TRUST_SCORER_AVAILABLE and trust_scorer:
+            ts = trust_scorer.get_trust_score(device_id)
+            if ts is not None:
+                node_trust_score = ts
+                node_trust_level = trust_scorer.get_trust_level(device_id)
         
-        # Add device node to topology
-        # Revoked devices will still appear but be visually marked as revoked (red color)
-        try:
-            packet_count = sum(device_data.get(device_id, []) or [])
-        except (TypeError, ValueError):
-            packet_count = 0
+        # Check if device is redirected to honeypot
+        is_redirected = any(
+            a.get('device_id') == device_id and a.get('redirected')
+            for a in suspicious_device_alerts
+        )
         
         topology["nodes"].append({
             "id": device_id,
@@ -900,15 +1170,17 @@ def get_topology_with_mac():
             "status": device_status,
             "type": "device",
             "last_seen": last_seen_time,
-            "packets": packet_count,
+            "packets": sum(device_data.get(device_id, [])),
             "onboarded": device_id in devices_from_db,
-            "honeypot_redirected": is_honeypot_redirected
+            "trust_score": node_trust_score,
+            "trust_level": node_trust_level,
+            "redirected_to_honeypot": is_redirected
         })
         
-        # Show edge connection to gateway for devices that are:
-        # 1. Not revoked AND
-        # 2. Currently online (seen in last 10 seconds)
-        if device_status != 'revoked' and online:
+        # Only add edge if device is ACTUALLY online (sending data within 10s)
+        # Untrusted devices (trust < 30) or honeypot-redirected devices are detached
+        is_untrusted = node_trust_level == 'untrusted' or is_redirected
+        if online and device_status != 'revoked' and not is_untrusted:
             topology["edges"].append({
                 "from": device_id,
                 "to": "ESP32_Gateway"
@@ -923,7 +1195,7 @@ def verify_certificate():
     
     Request JSON:
     {
-        "device_id": "ESP32_2"
+        "device_id": "DEVICE_ID"
     }
     
     Returns:
@@ -972,15 +1244,16 @@ def get_pending_devices():
     Returns:
         List of pending devices
     """
-    if not AUTO_ONBOARDING_AVAILABLE or not auto_onboarding_service:
+    manager = get_pending_manager()
+    if not manager:
         return json.dumps({
             'status': 'error',
-            'message': 'Auto-onboarding service not available',
+            'message': 'Pending device manager not available',
             'devices': []
         }), 503
     
     try:
-        pending_devices = auto_onboarding_service.get_pending_devices()
+        pending_devices = manager.get_pending_devices()
         return json.dumps({
             'status': 'success',
             'devices': pending_devices
@@ -1007,10 +1280,11 @@ def approve_device():
     Returns:
         Approval and onboarding result
     """
-    if not AUTO_ONBOARDING_AVAILABLE or not auto_onboarding_service:
+    manager = get_pending_manager()
+    if not manager:
         return json.dumps({
             'status': 'error',
-            'message': 'Auto-onboarding service not available'
+            'message': 'Pending device manager not available'
         }), 503
     
     try:
@@ -1024,13 +1298,84 @@ def approve_device():
                 'message': 'Missing mac_address'
             }), 400
         
-        # Approve and onboard device
-        result = auto_onboarding_service.approve_and_onboard(mac_address, admin_notes)
+        # If full service is available, use it
+        if auto_onboarding_service:
+            # Get pending device info before approval
+            pending_device = manager.get_device_by_mac(mac_address)
+            if not pending_device:
+                return json.dumps({
+                    'status': 'error',
+                    'message': 'Device not found in pending list'
+                }), 400
+            
+            device_id = pending_device.get('device_id')
+            
+            # Approve and onboard
+            result = auto_onboarding_service.approve_and_onboard(mac_address, admin_notes)
+            if result.get('status') == 'success':
+                # Set up tracking structures so device appears in topology
+                authorized_devices[device_id] = True
+                if device_id not in device_data:
+                    device_data[device_id] = []
+                if device_id not in last_seen:
+                    last_seen[device_id] = time.time()
+                if device_id not in packet_counts:
+                    packet_counts[device_id] = []
+                if mac_address:
+                    mac_addresses[device_id] = mac_address
+                
+                app.logger.info(f"Device {device_id} ({mac_address}) approved and added to topology tracking")
+                return json.dumps(result), 200
+            else:
+                return json.dumps(result), 400
         
-        if result.get('status') == 'success':
-            return json.dumps(result), 200
-        else:
-            return json.dumps(result), 400
+        # Fallback: approve via pending manager and optionally onboard
+        pending_device = manager.get_device_by_mac(mac_address)
+        if not pending_device:
+            return json.dumps({
+                'status': 'error',
+                'message': 'Device not found in pending list'
+            }), 400
+        
+        if not manager.approve_device(mac_address, admin_notes):
+            return json.dumps({
+                'status': 'error',
+                'message': 'Failed to approve device'
+            }), 400
+        
+        device_id = pending_device.get('device_id')
+        # Allow device to proceed through token/auth flow
+        authorized_devices[device_id] = True
+        if device_id not in device_data:
+            device_data[device_id] = []
+        if device_id not in last_seen:
+            last_seen[device_id] = time.time()
+        if device_id not in packet_counts:
+            packet_counts[device_id] = []
+        if mac_address:
+            mac_addresses[device_id] = mac_address
+        
+        # Attempt onboarding if module available
+        onboarding_result = None
+        if onboarding:
+            try:
+                onboarding_result = onboarding.onboard_device(
+                    device_id=device_id,
+                    mac_address=mac_address,
+                    device_type=pending_device.get('device_type'),
+                    device_info=pending_device.get('device_info')
+                )
+                if onboarding_result.get('status') == 'success':
+                    manager.mark_onboarded(mac_address)
+            except Exception as e:
+                app.logger.error(f"Onboarding error during fallback approval: {e}")
+                onboarding_result = {'status': 'error', 'message': str(e)}
+        
+        return json.dumps({
+            'status': 'success',
+            'message': 'Device approved',
+            'onboarding_result': onboarding_result
+        }), 200
             
     except Exception as e:
         app.logger.error(f"Error approving device: {e}")
@@ -1053,10 +1398,11 @@ def reject_device():
     Returns:
         Rejection result
     """
-    if not AUTO_ONBOARDING_AVAILABLE or not auto_onboarding_service:
+    manager = get_pending_manager()
+    if not manager:
         return json.dumps({
             'status': 'error',
-            'message': 'Auto-onboarding service not available'
+            'message': 'Pending device manager not available'
         }), 503
     
     try:
@@ -1071,7 +1417,10 @@ def reject_device():
             }), 400
         
         # Reject device
-        success = auto_onboarding_service.reject_device(mac_address, admin_notes)
+        if auto_onboarding_service:
+            success = auto_onboarding_service.reject_device(mac_address, admin_notes)
+        else:
+            success = manager.reject_device(mac_address, admin_notes)
         
         if success:
             return json.dumps({
@@ -1091,6 +1440,131 @@ def reject_device():
             'message': str(e)
         }), 500
 
+@app.route('/api/remove_device', methods=['POST'])
+def remove_device():
+    """
+    Permanently remove a device from the system.
+    This deletes all device data and allows the device to re-register as pending.
+    
+    Request JSON:
+    {
+        "device_id": "DEVICE_ID"
+    }
+    
+    Returns:
+        Removal result
+    """
+    try:
+        data = request.json
+        device_id = data.get('device_id')
+        
+        if not device_id:
+            return json.dumps({
+                'status': 'error',
+                'message': 'Missing device_id'
+            }), 400
+        
+        app.logger.info(f"Permanently removing device {device_id}...")
+        
+        # Remove from onboarding system (deletes DB records and certificates)
+        db_removed = False
+        if onboarding:
+            try:
+                db_removed = onboarding.remove_device(device_id)
+            except Exception as e:
+                app.logger.error(f"Onboarding removal error for {device_id}: {e}")
+        
+        # Clear from controller tracking structures
+        if device_id in authorized_devices:
+            del authorized_devices[device_id]
+        if device_id in device_data:
+            del device_data[device_id]
+        if device_id in last_seen:
+            del last_seen[device_id]
+        if device_id in packet_counts:
+            del packet_counts[device_id]
+        if device_id in device_tokens:
+            del device_tokens[device_id]
+            
+        # Remove from pending/approved list (IMPORTANT for preventing auto-reconnect)
+        pending_manager = get_pending_manager()
+        if pending_manager:
+            try:
+                pending_manager.remove_device(device_id)
+            except Exception as e:
+                app.logger.error(f"Error removing device from pending manager: {e}")
+        
+        # Remove MAC address mapping
+        # Remove MAC address mapping (Key is device_id)
+        if device_id in mac_addresses:
+            del mac_addresses[device_id]
+        
+        # Also brute-force check values just in case (though keys should be IDs)
+        # This handles potential inconsistencies in mapping
+        mac_keys_to_remove = [k for k, v in mac_addresses.items() if k == device_id or v == device_id]
+        for k in mac_keys_to_remove:
+             if k in mac_addresses:
+                 del mac_addresses[k]
+        
+        app.logger.info(f"Device {device_id} permanently removed from system")
+        
+        return json.dumps({
+            'status': 'success',
+            'message': f'Device {device_id} permanently removed',
+            'database_removed': db_removed,
+            'can_rejoin': True
+        }), 200
+            
+    except Exception as e:
+        app.logger.error(f"Error removing device: {e}")
+        return json.dumps({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/finalize_onboarding', methods=['POST'])
+def finalize_onboarding_route():
+    """
+    Manually finalize device onboarding (Stop profiling, generate baseline & policy)
+    
+    Request JSON:
+    {
+        "device_id": "DEVICE_ID"
+    }
+    
+    Returns:
+        Finalization result
+    """
+    if not ONBOARDING_AVAILABLE or not onboarding:
+        return json.dumps({
+            'status': 'error',
+            'message': 'Device onboarding system not available'
+        }), 503
+    
+    try:
+        data = request.json
+        device_id = data.get('device_id')
+        
+        if not device_id:
+            return json.dumps({
+                'status': 'error',
+                'message': 'Missing device_id'
+            }), 400
+            
+        app.logger.info(f"Manual finalization requested for {device_id}")
+        
+        result = onboarding.finalize_onboarding(device_id)
+        
+        status_code = 200 if result.get('status') == 'success' else 400
+        return json.dumps(result), status_code
+        
+    except Exception as e:
+        app.logger.error(f"Error finalizing onboarding: {e}")
+        return json.dumps({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
 @app.route('/api/device_history', methods=['GET'])
 def get_device_history():
     """
@@ -1103,10 +1577,11 @@ def get_device_history():
     Returns:
         Device approval history
     """
-    if not AUTO_ONBOARDING_AVAILABLE or not auto_onboarding_service:
+    manager = get_pending_manager()
+    if not manager:
         return json.dumps({
             'status': 'error',
-            'message': 'Auto-onboarding service not available',
+            'message': 'Pending device manager not available',
             'history': []
         }), 503
     
@@ -1114,7 +1589,10 @@ def get_device_history():
         mac_address = request.args.get('mac_address')
         limit = int(request.args.get('limit', 100))
         
-        history = auto_onboarding_service.get_device_history(mac_address, limit)
+        if auto_onboarding_service:
+            history = auto_onboarding_service.get_device_history(mac_address, limit)
+        else:
+            history = manager.get_device_history(mac_address, limit)
         
         return json.dumps({
             'status': 'success',
@@ -1123,6 +1601,156 @@ def get_device_history():
         
     except Exception as e:
         app.logger.error(f"Error getting device history: {e}")
+        return json.dumps({
+            'status': 'error',
+            'message': str(e),
+            'history': []
+        }), 500
+
+@app.route('/api/device_history/clear', methods=['POST'])
+def clear_device_history():
+    """Clear device approval history"""
+    manager = get_pending_manager()
+    if not manager:
+        return json.dumps({
+            'status': 'error',
+            'message': 'Pending device manager not available'
+        }), 503
+    
+    try:
+        success = False
+        if auto_onboarding_service:
+            success = auto_onboarding_service.clear_device_history()
+        else:
+            success = manager.clear_device_history()
+            
+        if success:
+            return json.dumps({'status': 'success'}), 200
+        else:
+            return json.dumps({
+                'status': 'error',
+                'message': 'Failed to clear history'
+            }), 500
+            
+    except Exception as e:
+        app.logger.error(f"Error clearing device history: {e}")
+        return json.dumps({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/certificates', methods=['GET'])
+def get_certificates():
+    """Get all device certificates"""
+    if not ONBOARDING_AVAILABLE or not onboarding:
+        return json.dumps({
+            'status': 'error',
+            'message': 'Device onboarding system not available'
+        }), 503
+
+    try:
+        devices = onboarding.identity_db.get_all_devices()
+        certificates = []
+        
+        for device in devices:
+            if device.get('certificate_path'):
+                # Determine status
+                status = 'valid'
+                if device.get('status') == 'revoked':
+                    status = 'revoked'
+                
+                # Check actual certificate validity if possible
+                valid_until = "N/A"
+                # TODO: Parse certificate for expiration date
+                
+                certificates.append({
+                    'device_id': device['device_id'],
+                    'mac_address': device['mac_address'],
+                    'status': status,
+                    'valid_until': valid_until,
+                    'certificate_path': device['certificate_path']
+                })
+        
+        return json.dumps({
+            'status': 'success',
+            'certificates': certificates
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error getting certificates: {e}")
+        return json.dumps({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+@app.route('/api/trust_scores', methods=['GET'])
+def get_trust_scores():
+    """Get all device trust scores"""
+    try:
+        scores = {}
+        
+        # Use live TrustScorer for real-time scores
+        if TRUST_SCORER_AVAILABLE and trust_scorer:
+            # Auto-initialize any known devices not yet tracked by the trust scorer
+            for dev_id in set(list(authorized_devices.keys()) + list(device_data.keys())):
+                if trust_scorer.get_trust_score(dev_id) is None:
+                    trust_scorer.initialize_device(dev_id)
+            scores = trust_scorer.get_all_scores()
+        # Fallback to database
+        elif ONBOARDING_AVAILABLE and onboarding:
+            scores = onboarding.identity_db.load_all_trust_scores()
+        
+        # Include trust level for each device
+        scores_with_levels = {}
+        for device_id, score in scores.items():
+            level = 'unknown'
+            if TRUST_SCORER_AVAILABLE and trust_scorer:
+                level = trust_scorer.get_trust_level(device_id)
+            elif score >= 70:
+                level = 'trusted'
+            elif score >= 50:
+                level = 'monitored'
+            elif score >= 30:
+                level = 'suspicious'
+            else:
+                level = 'untrusted'
+            scores_with_levels[device_id] = {
+                'score': score,
+                'level': level
+            }
+        
+        return json.dumps({
+            'status': 'success',
+            'scores': scores,
+            'details': scores_with_levels
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error getting trust scores: {e}")
+        return json.dumps({
+            'status': 'error',
+            'message': str(e),
+            'scores': {}
+        }), 500
+
+@app.route('/api/trust_scores/<device_id>/history', methods=['GET'])
+def get_trust_score_history(device_id):
+    """Get trust score history for a specific device"""
+    try:
+        limit = int(request.args.get('limit', 100))
+        history = []
+        
+        if ONBOARDING_AVAILABLE and onboarding:
+            history = onboarding.identity_db.get_trust_score_history(device_id, limit)
+        
+        return json.dumps({
+            'status': 'success',
+            'device_id': device_id,
+            'history': history
+        }), 200
+        
+    except Exception as e:
+        app.logger.error(f"Error getting trust score history for {device_id}: {e}")
         return json.dumps({
             'status': 'error',
             'message': str(e),
@@ -1498,26 +2126,26 @@ def start_ml_engine():
         
     global ml_engine, ml_monitoring_active
     try:
-        print("🚀 Initializing ML Security Engine...")
+        print(" [INFO] Initializing ML Security Engine...")
         ml_engine = initialize_ml_engine()
         if ml_engine and hasattr(ml_engine, 'is_loaded') and ml_engine.is_loaded:
             ml_monitoring_active = True
             if hasattr(ml_engine, 'start_monitoring'):
                 ml_engine.start_monitoring()
-            print("✅ ML Security Engine initialized and monitoring started")
+            print(" [OK] ML Security Engine initialized and monitoring started")
             return True
         else:
-            print("⚠️  ML engine initialization skipped (using heuristic detection)")
+            print(" [WARN] ML engine initialization skipped (using heuristic detection)")
             return False
     except Exception as e:
-        print(f"⚠️  ML initialization failed: {str(e)}")
+        print(f" [FAIL] ML initialization failed: {str(e)}")
         print("   System will run with heuristic-based detection only")
         return False
 
 # Suspicious Device Alert Management
 def create_suspicious_device_alert(device_id, reason, severity, redirected=True):
     """
-    Create a suspicious device alert
+    Create a suspicious device alert and reduce trust score
     
     Args:
         device_id: Device identifier
@@ -1525,6 +2153,27 @@ def create_suspicious_device_alert(device_id, reason, severity, redirected=True)
         severity: Alert severity ('low', 'medium', 'high')
         redirected: Whether device was redirected to honeypot
     """
+    # === REDUCE TRUST SCORE on alert ===
+    current_score = None
+    trust_level = 'unknown'
+    if TRUST_SCORER_AVAILABLE and trust_scorer:
+        try:
+            # Initialize device if not already tracked
+            if trust_scorer.get_trust_score(device_id) is None:
+                trust_scorer.initialize_device(device_id)
+            
+            # Record security alert — this reduces the trust score
+            trust_scorer.record_security_alert(device_id, reason, severity)
+            current_score = trust_scorer.get_trust_score(device_id)
+            trust_level = trust_scorer.get_trust_level(device_id)
+            
+            app.logger.warning(
+                f"🔻 Trust score for {device_id}: {current_score} (level: {trust_level}) "
+                f"after {reason} [{severity}]"
+            )
+        except Exception as e:
+            app.logger.error(f"Failed to adjust trust score for {device_id}: {e}")
+    
     # Check if alert already exists for this device
     existing_alert = None
     for alert in suspicious_device_alerts:
@@ -1537,6 +2186,10 @@ def create_suspicious_device_alert(device_id, reason, severity, redirected=True)
         existing_alert['timestamp'] = datetime.now().isoformat()
         existing_alert['reason'] = reason
         existing_alert['severity'] = severity
+        existing_alert['trust_score'] = current_score
+        existing_alert['trust_level'] = trust_level
+        existing_alert['detection_count'] = existing_alert.get('detection_count', 0) + 1
+        existing_alert['honeypot_activity_count'] = existing_alert.get('honeypot_activity_count', 0) + 1
         return existing_alert
     
     alert = {
@@ -1545,7 +2198,10 @@ def create_suspicious_device_alert(device_id, reason, severity, redirected=True)
         'reason': reason,
         'severity': severity,
         'redirected': redirected,
-        'honeypot_activity_count': 0
+        'honeypot_activity_count': 1,
+        'trust_score': current_score,
+        'trust_level': trust_level,
+        'detection_count': 1
     }
     suspicious_device_alerts.append(alert)
     # Keep only last 100 alerts
@@ -1613,93 +2269,6 @@ def get_suspicious_device_alerts():
         'alerts': suspicious_device_alerts[-50:]  # Return last 50 alerts
     }), 200
 
-@app.route('/api/trust_scores', methods=['GET'])
-def get_trust_scores():
-    """
-    Get all device trust scores
-    
-    Returns:
-        JSON dictionary mapping device_id to trust score
-    """
-    if not ONBOARDING_AVAILABLE or not onboarding:
-        response = app.response_class(
-            response=json.dumps({
-                'status': 'error',
-                'message': 'Device onboarding system not available'
-            }),
-            status=503,
-            mimetype='application/json'
-        )
-        return response
-    
-    try:
-        # Get trust scores from database
-        scores = onboarding.identity_db.load_all_trust_scores()
-        
-        # Calculate average score
-        avg_score = 0
-        if scores:
-            avg_score = sum(scores.values()) / len(scores)
-            
-        response = app.response_class(
-            response=json.dumps({
-                'status': 'success',
-                'scores': scores,
-                'average_score': round(avg_score, 1)
-            }),
-            status=200,
-            mimetype='application/json'
-        )
-        return response
-        
-    except Exception as e:
-        app.logger.error(f"Error getting trust scores: {e}")
-        response = app.response_class(
-            response=json.dumps({
-                'status': 'error',
-                'message': str(e),
-                'scores': {}
-            }),
-            status=500,
-            mimetype='application/json'
-        )
-        return response
-
-@app.route('/api/trust_score_history/<device_id>', methods=['GET'])
-def get_trust_score_history(device_id):
-    """
-    Get trust score history for a device
-    
-    Args:
-        device_id: Device identifier
-        
-    Returns:
-        JSON list of history entries
-    """
-    if not ONBOARDING_AVAILABLE or not onboarding:
-        return json.dumps({
-            'status': 'error',
-            'message': 'Device onboarding system not available'
-        }), 503
-    
-    try:
-        limit = int(request.args.get('limit', 50))
-        history = onboarding.identity_db.get_trust_score_history(device_id, limit)
-        
-        return json.dumps({
-            'status': 'success',
-            'device_id': device_id,
-            'history': history
-        }), 200
-        
-    except Exception as e:
-        app.logger.error(f"Error getting trust score history: {e}")
-        return json.dumps({
-            'status': 'error',
-            'message': str(e),
-            'history': []
-        }), 500
-
 @app.route('/api/alerts/create', methods=['POST'])
 def create_alert():
     """
@@ -1707,7 +2276,7 @@ def create_alert():
     
     Request JSON:
     {
-        "device_id": "ESP32_2",
+        "device_id": "DEVICE_ID",
         "reason": "ml_detection",
         "severity": "high",
         "redirected": true
@@ -1753,7 +2322,7 @@ def update_alert_activity():
     
     Request JSON:
     {
-        "device_id": "ESP32_2",
+        "device_id": "DEVICE_ID",
         "activity_count": 5
     }
     """
@@ -1815,49 +2384,29 @@ def get_honeypot_status():
             container_status = deployer.get_status()
             is_running = deployer.is_running()
             
-            # Get threats from redirected devices with activity
+            # Populate threats from suspicious device alerts
             threats = []
             blocked_ips = []
             mitigation_rules = []
             
-            # Check for redirected devices and generate threat data
-            redirected_count = 0
             for alert in suspicious_device_alerts:
-                if alert.get('redirected', False):
-                    redirected_count += 1
-                    device_id = alert.get('device_id')
-                    activity_count = alert.get('honeypot_activity_count', 0)
-                    
-                    # Generate sample threat data for devices with activity
-                    if activity_count > 0:
-                        # Add sample threats
-                        for i in range(min(activity_count, 5)):
-                            threats.append({
-                                'source_ip': f'10.0.0.{100 + redirected_count}',
-                                'event_type': 'SSH Brute Force',
-                                'severity': 'high',
-                                'timestamp': datetime.now().isoformat(),
-                                'device_id': device_id,
-                                'details': f'Failed login attempt #{i+1}'
-                            })
-                        
-                        # Add blocked IPs
-                        blocked_ips.append({
-                            'ip': f'10.0.0.{100 + redirected_count}',
-                            'reason': 'Multiple failed authentication attempts',
-                            'blocked_at': datetime.now().isoformat(),
-                            'device_id': device_id
-                        })
-                        
-                        # Add mitigation rules
-                        mitigation_rules.append({
-                            'match_fields': {
-                                'ipv4_src': f'10.0.0.{100 + redirected_count}'
-                            },
-                            'type': 'DROP',
-                            'reason': f'Honeypot threat from {device_id}',
-                            'generated_at': datetime.now().isoformat()
-                        })
+                threats.append({
+                    'device_id': alert.get('device_id'),
+                    'timestamp': alert.get('timestamp'),
+                    'type': alert.get('reason', 'unknown'),
+                    'severity': alert.get('severity', 'medium'),
+                    'trust_score': alert.get('trust_score'),
+                    'trust_level': alert.get('trust_level'),
+                    'detection_count': alert.get('detection_count', 1)
+                })
+                # Treat devices with trust score < 30 as effectively blocked
+                ts = alert.get('trust_score')
+                if ts is not None and ts < 30:
+                    blocked_ips.append({
+                        'device_id': alert.get('device_id'),
+                        'reason': f'Trust score critically low: {ts}',
+                        'blocked_at': alert.get('timestamp')
+                    })
             
             return json.dumps({
                 'status': 'running' if is_running else 'stopped',
@@ -1906,7 +2455,10 @@ def get_redirected_devices():
                     'timestamp': alert.get('timestamp'),
                     'reason': alert.get('reason'),
                     'severity': alert.get('severity'),
-                    'activity_count': alert.get('honeypot_activity_count', 0)
+                    'activity_count': alert.get('honeypot_activity_count', 0),
+                    'trust_score': alert.get('trust_score'),
+                    'trust_level': alert.get('trust_level'),
+                    'detection_count': alert.get('detection_count', 1)
                 })
         
         # Check honeypot container status
@@ -1946,21 +2498,40 @@ def get_device_honeypot_activity(device_id):
     try:
         limit = int(request.args.get('limit', 100))
         
-        # Get activity count from alert if it exists
-        # The activity count is updated by the honeypot monitoring thread via API
+        # Get activity and detection data from alerts
         activity_count = 0
         activities = []
+        trust_score = None
+        trust_level = 'unknown'
         
         for alert in suspicious_device_alerts:
             if alert.get('device_id') == device_id:
                 activity_count = alert.get('honeypot_activity_count', 0)
-                break
+                trust_score = alert.get('trust_score')
+                trust_level = alert.get('trust_level', 'unknown')
+                # Build activity entry from alert data
+                activities.append({
+                    'timestamp': alert.get('timestamp'),
+                    'type': alert.get('reason', 'ml_detection'),
+                    'severity': alert.get('severity', 'medium'),
+                    'detection_count': alert.get('detection_count', 1),
+                    'trust_score_at_time': trust_score
+                })
+        
+        # Also get live trust score if available
+        if TRUST_SCORER_AVAILABLE and trust_scorer:
+            live_score = trust_scorer.get_trust_score(device_id)
+            if live_score is not None:
+                trust_score = live_score
+                trust_level = trust_scorer.get_trust_level(device_id)
         
         return json.dumps({
             'status': 'success',
             'device_id': device_id,
             'activities': activities,
-            'count': activity_count
+            'count': activity_count,
+            'trust_score': trust_score,
+            'trust_level': trust_level
         }), 200
     except Exception as e:
         app.logger.error(f"Error getting device activity: {e}")
@@ -1992,206 +2563,136 @@ def remove_device_redirect(device_id):
             'message': str(e)
         }), 500
 
-@app.route('/api/certificates', methods=['GET'])
-def get_certificates():
+@app.route('/api/system_reset', methods=['POST'])
+def system_reset():
     """
-    Get all device certificates and their status
-    
-    Returns:
-        JSON with list of certificates and their status (valid/expired/expiring)
+    Full system reset — clears all device state, databases, certificates,
+    and in-memory tracking. The controller stays running but behaves as if
+    freshly started. Useful for testing / demo cycles.
     """
-    if not ONBOARDING_AVAILABLE or not onboarding:
-        return jsonify({
-            'status': 'error',
-            'message': 'Device onboarding system not available',
-            'certificates': []
-        }), 503
-    
-    try:
-        # Get all devices from database
-        devices = onboarding.identity_db.get_all_devices()
-        
-        certificates = []
-        current_time = datetime.now()
-        
-        for device in devices:
-            device_id = device.get('device_id')
-            mac_address = device.get('mac_address')
-            cert_path = device.get('certificate_path')
-            
-            if not cert_path or not os.path.exists(cert_path):
-                continue
-            
-            # Determine certificate status
-            cert_status = 'unknown'
-            valid_until = None
-            
-            try:
-                # Try to get certificate expiry date
-                if CRYPTOGRAPHY_AVAILABLE:
-                    try:
-                        from cryptography import x509
-                        from cryptography.hazmat.backends import default_backend
-                        
-                        with open(cert_path, 'rb') as f:
-                            cert = x509.load_pem_x509_certificate(f.read(), default_backend())
-                        
-                        not_after = cert.not_valid_after
-                        not_before = cert.not_valid_before
-                        
-                        # Convert to datetime if needed
-                        if hasattr(not_after, 'replace'):
-                            # Already a datetime
-                            pass
-                        
-                        valid_until = not_after.strftime('%Y-%m-%d %H:%M:%S')
-                        
-                        # Check if expired
-                        if not_after < current_time:
-                            cert_status = 'expired'
-                        elif not_before > current_time:
-                            cert_status = 'not_yet_valid'
-                        else:
-                            # Check if expiring soon (within 30 days)
-                            days_until_expiry = (not_after - current_time).days
-                            if days_until_expiry <= 30:
-                                cert_status = 'expiring'
-                            else:
-                                cert_status = 'valid'
-                    except Exception as e:
-                        app.logger.warning(f"Error reading certificate for {device_id}: {e}")
-                        cert_status = 'error'
-                else:
-                    # Cryptography not available, assume valid
-                    cert_status = 'valid'
-                    valid_until = 'Unknown'
-            except Exception as e:
-                app.logger.error(f"Error checking certificate for {device_id}: {e}")
-                cert_status = 'error'
-            
-            certificates.append({
-                'device_id': device_id,
-                'mac_address': mac_address,
-                'status': cert_status,
-                'valid_until': valid_until,
-                'certificate_path': cert_path
-            })
-        
-        return jsonify({
-            'status': 'success',
-            'certificates': certificates
-        }), 200
-        
-    except Exception as e:
-        app.logger.error(f"Error getting certificates: {e}")
-        return jsonify({
-            'status': 'error',
-            'message': str(e),
-            'certificates': []
-        }), 500
+    global authorized_devices, device_data, timestamps, last_seen
+    global device_tokens, packet_counts, failed_token_requests
+    global mac_addresses, policy_logs, suspicious_device_alerts
+    global _last_trust_reduction, ml_engine, ml_monitoring_active, sdn_policies
 
-@app.route('/api/certificates/<device_id>/revoke', methods=['POST'])
-def revoke_certificate(device_id):
-    """
-    Revoke a device certificate and disconnect the device from network
-    
-    Args:
-        device_id: Device identifier
-    """
-    if not ONBOARDING_AVAILABLE or not onboarding:
-        return jsonify({
-            'success': False,
-            'error': 'Device onboarding system not available'
-        }), 503
-    
-    try:
-        # Update device status to revoked
-        success = onboarding.identity_db.update_device_status(device_id, 'revoked')
-        
-        if success:
-            # Also try to revoke certificate through certificate manager
-            if hasattr(onboarding, 'cert_manager'):
-                try:
-                    onboarding.cert_manager.revoke_certificate(device_id)
-                except Exception as e:
-                    app.logger.warning(f"Certificate manager revocation failed: {e}")
-            
-            # Disconnect device from network by clearing tracking data
-            # This makes the device appear offline in the topology
-            if device_id in last_seen:
-                del last_seen[device_id]
-            
-            # Clear device token to invalidate any active sessions
-            if device_id in device_tokens:
-                del device_tokens[device_id]
-            
-            # Clear device data
-            if device_id in device_data:
-                del device_data[device_id]
-            
-            # Clear packet counts
-            if device_id in packet_counts:
-                del packet_counts[device_id]
-            
-            # Update in-memory authorization status so Devices tab shows correct button
-            authorized_devices[device_id] = False
-            
-            app.logger.info(f"Device {device_id} revoked and disconnected from network topology")
-            
-            return jsonify({
-                'success': True,
-                'message': f'Certificate revoked and device {device_id} disconnected from network'
-            }), 200
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'Failed to revoke certificate'
-            }), 500
-            
-    except Exception as e:
-        app.logger.error(f"Error revoking certificate: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+    app.logger.warning("🔄 SYSTEM RESET requested — clearing ALL state...")
+    errors = []
 
-def initialize_sensor_c_honeypot_redirect():
-    """
-    Initialize honeypot redirect for Sensor_C test device
-    This is called after all functions are defined so create_suspicious_device_alert is available
-    """
+    # 1. Clear in-memory tracking structures
+    authorized_devices.clear()
+    device_data.clear()
+    timestamps.clear()
+    last_seen.clear()
+    device_tokens.clear()
+    packet_counts.clear()
+    failed_token_requests.clear()
+    mac_addresses.clear()
+    policy_logs.clear()
+    suspicious_device_alerts.clear()
+    _last_trust_reduction.clear()
+
+    # Reset SDN policies to disabled
+    for key in sdn_policies:
+        sdn_policies[key] = False
+
+    # 2. Clear identity database (identity.db)
+    if ONBOARDING_AVAILABLE and onboarding and hasattr(onboarding, 'identity_db'):
+        try:
+            db = onboarding.identity_db
+            conn = sqlite3.connect(db.db_path)
+            cursor = conn.cursor()
+            # Get all table names and delete their contents
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = cursor.fetchall()
+            for (table_name,) in tables:
+                cursor.execute(f"DELETE FROM {table_name}")
+            conn.commit()
+            conn.close()
+            app.logger.info("  ✅ Identity database cleared")
+        except Exception as e:
+            errors.append(f"identity_db: {e}")
+            app.logger.error(f"  ❌ Failed to clear identity database: {e}")
+
+    # 3. Clear pending devices database (pending_devices.db)
+    pm = get_pending_manager()
+    if pm and hasattr(pm, 'db_path'):
+        try:
+            conn = sqlite3.connect(pm.db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = cursor.fetchall()
+            for (table_name,) in tables:
+                cursor.execute(f"DELETE FROM {table_name}")
+            conn.commit()
+            conn.close()
+            app.logger.info("  ✅ Pending devices database cleared")
+        except Exception as e:
+            errors.append(f"pending_db: {e}")
+            app.logger.error(f"  ❌ Failed to clear pending devices database: {e}")
+
+    # 4. Delete device certificate files (but keep CA)
     try:
-        # Create honeypot redirect alert for Sensor_C (simulated suspicious device)
-        alert = create_suspicious_device_alert(
-            device_id="Sensor_C",
-            reason="anomaly_detected",
-            severity="high",
-            redirected=True
-        )
-        # Add simulated honeypot activity count for display
-        alert['honeypot_activity_count'] = 5
-        print(f"✅ Sensor_C configured for honeypot redirection with simulated threat data")
+        certs_dir = os.path.join(os.path.dirname(__file__), 'certs')
+        if os.path.exists(certs_dir):
+            removed_count = 0
+            for filename in os.listdir(certs_dir):
+                # Keep CA files (ca_cert.pem, ca_key.pem) and any config files
+                if filename.startswith('ca_') or filename.endswith('.cnf') or filename.endswith('.srl'):
+                    continue
+                filepath = os.path.join(certs_dir, filename)
+                if os.path.isfile(filepath):
+                    os.remove(filepath)
+                    removed_count += 1
+            app.logger.info(f"  ✅ Removed {removed_count} device certificate files")
     except Exception as e:
-        print(f"⚠️  Error creating honeypot redirect for Sensor_C: {e}")
+        errors.append(f"certs: {e}")
+        app.logger.error(f"  ❌ Failed to clean certificate files: {e}")
+
+    # 5. Reset trust scorer
+    if TRUST_SCORER_AVAILABLE and trust_scorer:
+        try:
+            trust_scorer.device_scores.clear()
+            trust_scorer.score_history.clear()
+            app.logger.info("  ✅ Trust scorer reset")
+        except Exception as e:
+            errors.append(f"trust_scorer: {e}")
+            app.logger.error(f"  ❌ Failed to reset trust scorer: {e}")
+
+    # 6. Reset ML engine detection history
+    if ml_engine and hasattr(ml_engine, 'network_stats'):
+        try:
+            ml_engine.network_stats = {}
+            if hasattr(ml_engine, 'detection_history'):
+                ml_engine.detection_history = []
+            app.logger.info("  ✅ ML engine stats reset")
+        except Exception as e:
+            errors.append(f"ml_engine: {e}")
+
+    app.logger.warning("🔄 SYSTEM RESET complete — system is fresh")
+
+    return json.dumps({
+        'status': 'success',
+        'message': 'System reset complete — all devices, certificates, and state cleared',
+        'errors': errors if errors else None,
+        'note': 'ESP32 devices will auto-reconnect and appear as new pending devices'
+    }), 200
+
 
 if __name__ == '__main__':
     # Start ML engine before running the app (optional)
     start_ml_engine()
     
-    # Initialize Sensor_C honeypot redirect alert
-    initialize_sensor_c_honeypot_redirect()
-    
     # Start activity count updater thread
     start_activity_count_updater()
     
     # Run the Flask app
-    print("🌐 Starting Flask Controller on http://0.0.0.0:5000")
+    print(" [INFO] Starting Flask Controller on http://0.0.0.0:5000")
     try:
         app.run(host='0.0.0.0', port=5000, use_reloader=False, debug=False, threaded=True)  # disable reloader to prevent duplicate ML engine initialization
     except KeyboardInterrupt:
-        print("\n🛑 Flask Controller stopped by user")
+        print("\n [INFO] Flask Controller stopped by user")
     except Exception as e:
-        print(f"❌ Flask Controller error: {e}")
+        print(f" [FAIL] Flask Controller error: {e}")
         import traceback
         traceback.print_exc()
         raise

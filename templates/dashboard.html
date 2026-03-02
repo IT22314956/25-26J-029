@@ -207,6 +207,28 @@
             color: var(--text-secondary);
         }
 
+        /* New column width adjustments */
+        .device-table th:nth-child(1) {
+            width: 15%;
+        }
+
+        /* Device ID */
+        .device-table th:nth-child(2) {
+            width: 10%;
+        }
+
+        /* Status */
+        .device-table th:nth-child(3) {
+            width: 10%;
+        }
+
+        /* Auth */
+        .device-table th:nth-child(4) {
+            width: 10%;
+        }
+
+        /* Cert */
+
         .status-badge {
             padding: 0.4rem 0.75rem;
             border-radius: 1rem;
@@ -950,7 +972,7 @@
         }
 
         .search-box::before {
-            content: '';
+            content: '🔍';
             position: absolute;
             left: 1rem;
             top: 50%;
@@ -1005,13 +1027,45 @@
             color: var(--text-primary);
             border-color: var(--accent-color);
         }
+
+        .version-badge {
+            margin-left: 0.6rem;
+            padding: 0.2rem 0.55rem;
+            border-radius: 999px;
+            background: var(--accent-color);
+            color: var(--text-primary);
+            font-size: 0.85rem;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+        }
     </style>
     <script src="static/vis-network.min.js"></script>
 </head>
 
 <body>
     <header class="dashboard-header">
-        <h1>SecureIoT Command Center</h1>
+        <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+            <h1>SecureIoT Command Center </h1>
+            <button id="reset-system-btn" onclick="showResetModal()" style="
+                padding: 0.5rem 1.2rem;
+                border: 2px solid rgba(239, 68, 68, 0.4);
+                border-radius: 8px;
+                background: rgba(239, 68, 68, 0.1);
+                color: #f87171;
+                font-family: 'Inter', sans-serif;
+                font-size: 0.85rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.2s ease;
+                display: flex;
+                align-items: center;
+                gap: 0.4rem;
+                white-space: nowrap;
+            " onmouseover="this.style.background='rgba(239,68,68,0.2)';this.style.borderColor='rgba(239,68,68,0.6)'"
+                onmouseout="this.style.background='rgba(239,68,68,0.1)';this.style.borderColor='rgba(239,68,68,0.4)'">
+                🔄 Reset System
+            </button>
+        </div>
         <nav class="tab-navigation" role="tablist" aria-label="Main Navigation">
             <button class="tab-button active" data-tab="overview" role="tab" aria-controls="overview"
                 tabindex="0">Overview</button>
@@ -1034,12 +1088,72 @@
         </nav>
     </header>
 
+    <!-- System Reset Confirmation Modal -->
+    <div id="reset-modal" style="
+        display: none;
+        position: fixed;
+        top: 0; left: 0; right: 0; bottom: 0;
+        background: rgba(0,0,0,0.7);
+        backdrop-filter: blur(4px);
+        z-index: 9999;
+        display: none;
+        align-items: center;
+        justify-content: center;
+    ">
+        <div style="
+            background: var(--secondary-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 2rem;
+            max-width: 480px;
+            width: 90%;
+            box-shadow: 0 25px 60px rgba(0,0,0,0.5);
+            text-align: center;
+        ">
+            <div style="font-size: 3rem; margin-bottom: 1rem;">⚠️</div>
+            <h2 style="color: var(--text-primary); margin-bottom: 0.75rem; font-size: 1.4rem;">Reset Entire System?</h2>
+            <p style="color: var(--text-secondary); margin-bottom: 1.5rem; line-height: 1.6; font-size: 0.95rem;">
+                This will <strong style="color: #f87171;">permanently delete</strong> all devices, certificates,
+                trust scores, alerts, and approval history. The controller will remain running
+                but start completely fresh.<br><br>
+                <span style="color: var(--text-secondary); font-size: 0.85rem;">ESP32 devices will auto-reconnect as new
+                    pending devices.</span>
+            </p>
+            <div style="display: flex; gap: 1rem; justify-content: center;">
+                <button onclick="hideResetModal()" style="
+                    padding: 0.7rem 1.5rem;
+                    border-radius: 8px;
+                    border: 1px solid var(--border-color);
+                    background: var(--primary-bg);
+                    color: var(--text-primary);
+                    font-family: 'Inter', sans-serif;
+                    font-size: 0.9rem;
+                    font-weight: 500;
+                    cursor: pointer;
+                ">Cancel</button>
+                <button onclick="performSystemReset()" id="confirm-reset-btn" style="
+                    padding: 0.7rem 1.5rem;
+                    border-radius: 8px;
+                    border: none;
+                    background: linear-gradient(135deg, #ef4444, #dc2626);
+                    color: white;
+                    font-family: 'Inter', sans-serif;
+                    font-size: 0.9rem;
+                    font-weight: 600;
+                    cursor: pointer;
+                    transition: all 0.2s ease;
+                " onmouseover="this.style.transform='scale(1.02)'" onmouseout="this.style.transform='scale(1)'">Yes,
+                    Reset Everything</button>
+            </div>
+        </div>
+    </div>
+
     <main class="container">
         <!-- Overview Tab -->
         <section id="overview" class="tab-content active">
             <div class="grid-container">
                 <div class="card">
-                    <h3>Network Status</h3>
+                    <h3>🌐 Network Status</h3>
                     <div class="metric-value" id="total-devices">0</div>
                     <div class="metric-label">Total Devices</div>
                     <div style="margin-top: 0.5rem; font-size: 0.875rem; color: var(--text-secondary);">
@@ -1047,7 +1161,7 @@
                     </div>
                 </div>
                 <div class="card">
-                    <h3>Network Traffic</h3>
+                    <h3>📊 Network Traffic</h3>
                     <div class="metric-value" id="overview-total-packets">0</div>
                     <div class="metric-label">Total Packets Processed</div>
                     <div style="margin-top: 0.5rem; font-size: 0.875rem; color: var(--text-secondary);">
@@ -1055,15 +1169,15 @@
                     </div>
                 </div>
                 <div class="card">
-                    <h3>Attack Rate</h3>
+                    <h3>⚠️ Attack Rate</h3>
                     <div class="metric-value" id="overview-attack-rate">0%</div>
                     <div class="metric-label">Threat Detection Rate</div>
                     <div style="margin-top: 0.5rem; font-size: 0.875rem; color: var(--text-secondary);">
                         <span id="overview-attack-packets">0</span> attack packets detected
                     </div>
                 </div>
-                <div class="card">
-                    <h3>System Health</h3>
+                <!--<div class="card">
+                    <h3>💚 System Health</h3>
                     <div style="display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem;">
                         <div class="progress-bar" style="flex: 1;">
                             <div id="system-health" style="width: 0%"></div>
@@ -1072,11 +1186,11 @@
                             id="health-percentage">0%</div>
                     </div>
                     <div class="metric-label">Device Availability</div>
-                </div>
+                </div>-->
             </div>
             <div class="grid-container" style="margin-top: 1rem;">
                 <div class="card">
-                    <h3>ML Engine Status</h3>
+                    <h3>🤖 ML Engine Status</h3>
                     <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem;">
                         <span class="status-dot-large" id="overview-ml-status-dot"></span>
                         <span id="overview-ml-status-text" style="font-weight: 500;">Initializing...</span>
@@ -1086,7 +1200,7 @@
                             id="overview-detection-accuracy">--</span></div>
                 </div>
                 <div class="card">
-                    <h3>Security Alerts</h3>
+                    <h3>🔒 Security Alerts</h3>
                     <div class="metric-value" id="overview-alerts-count">0</div>
                     <div class="metric-label">Active Alerts</div>
                     <div style="margin-top: 0.5rem; font-size: 0.875rem;">
@@ -1095,7 +1209,7 @@
                     </div>
                 </div>
                 <div class="card">
-                    <h3>Honeypot Status</h3>
+                    <h3>🍯 Honeypot Status</h3>
                     <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem;">
                         <span class="status-dot" id="overview-honeypot-status-dot"></span>
                         <span id="overview-honeypot-status" style="font-weight: 500;">Stopped</span>
@@ -1104,27 +1218,64 @@
                     <div class="metric-label" style="margin-top: 0.5rem;">Redirected Devices: <span
                             id="overview-redirected-devices">0</span></div>
                 </div>
+                <div class="card">
+                    <h3>⭐ Trust Score Status</h3>
+                    <div class="metric-value" id="overview-avg-trust" style="color: var(--primary-color);">--</div>
+                    <div class="metric-label">Average Trust Score</div>
+                    <div style="margin-top: 0.5rem; font-size: 0.875rem;">
+                        <span style="color: var(--success-color);" id="overview-trusted-count">0</span> trusted |
+                        <span style="color: var(--danger-color);" id="overview-suspicious-count">0</span> suspicious
+                    </div>
+                </div>
             </div>
             <div class="card" style="margin-top: 1rem;">
-                <h3>Network Topology</h3>
+                <h3>🗺️ Network Topology</h3>
                 <div class="network-topology" id="network-visualization"></div>
             </div>
         </section>
 
         <!-- Devices Tab -->
         <section id="devices" class="tab-content">
-
+            <div class="grid-container">
+                <div class="card">
+                    <h3>📱 Device Statistics</h3>
+                    <div class="stats-grid">
+                        <div class="stat-item">
+                            <div class="stat-icon">🌐</div>
+                            <div class="stat-content">
+                                <div class="stat-value" id="devices-total-count">0</div>
+                                <div class="stat-label">Total Devices</div>
+                            </div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-icon">✅</div>
+                            <div class="stat-content">
+                                <div class="stat-value" id="devices-online-count">0</div>
+                                <div class="stat-label">Online</div>
+                            </div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-icon">📦</div>
+                            <div class="stat-content">
+                                <div class="stat-value" id="devices-total-packets">0</div>
+                                <div class="stat-label">Total Packets</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
             <div class="card">
-                <h3>Connected Devices</h3>
+                <h3>🔌 Connected Devices</h3>
                 <div class="scroll-container">
                     <table class="device-table">
                         <thead>
                             <tr>
                                 <th>Device ID</th>
                                 <th>Status</th>
-                                <th>Authorization</th>
+                                <th>Certificate</th>
                                 <th>Packets</th>
                                 <th>Packets/Min</th>
+                                <th>Trust Score</th>
                                 <th>Last Seen</th>
                                 <th>Actions</th>
                             </tr>
@@ -1138,24 +1289,18 @@
                                         Checking...
                                     </span>
                                 </td>
-                                <td>
-                                    <span class="status-badge {{ 'authorized' if authorized else 'unauthorized' }}">
-                                        {{ 'Authorized' if authorized else 'Unauthorized' }}
-                                    </span>
-                                </td>
                                 <td id="packets-{{ device }}">{{ data[device] }}</td>
                                 <td id="packets-per-min-{{ device }}">0</td>
+                                <td id="trust-score-{{ device }}">
+                                    <span class="status-badge"
+                                        style="background-color: #ffc107; color: #212529;">--</span>
+                                </td>
                                 <td id="last-seen-{{ device }}">--</td>
                                 <td>
-                                    <form method="POST" action="/update" style="display: inline;">
-                                        <input type="hidden" name="device_id" value="{{ device }}">
-                                        <input type="hidden" name="action"
-                                            value="{{ 'revoke' if authorized else 'authorize' }}">
-                                        <button type="submit"
-                                            class="button {{ 'button-danger' if authorized else 'button-primary' }}">
-                                            {{ 'Revoke' if authorized else 'Authorize' }}
-                                        </button>
-                                    </form>
+                                    <button class="button button-danger" onclick="removeDevice('{{ device }}')"
+                                        style="margin-left: 0.5rem; background-color: #d32f2f;">
+                                        Delete
+                                    </button>
                                 </td>
                             </tr>
                             {% endfor %}
@@ -1169,7 +1314,7 @@
         <section id="security" class="tab-content">
             <div class="grid-container">
                 <div class="card">
-                    <h3>Security Policies</h3>
+                    <h3>🛡️ Security Policies</h3>
                     <div class="policy-toggle">
                         <div class="policy-info">
                             <span class="policy-name">Packet Inspection</span>
@@ -1205,7 +1350,7 @@
                     </div>
                 </div>
                 <div class="card">
-                    <h3>Security Alerts</h3>
+                    <h3>🚨 Security Alerts</h3>
                     <div id="security-alerts" class="scroll-container">
                         <div class="alert-filters">
                             <button class="filter-btn active" data-severity="all">All</button>
@@ -1218,7 +1363,7 @@
                 </div>
             </div>
             <div class="card">
-                <h3>Policy Logs</h3>
+                <h3>📋 Policy Logs</h3>
                 <div class="policy-logs-header">
                     <div class="search-box">
                         <input type="text" id="log-search" placeholder="Search logs...">
@@ -1236,7 +1381,7 @@
         <section id="ml-engine" class="tab-content">
             <!-- ML Engine Status Card -->
             <div class="card">
-                <h3>ML Security Engine</h3>
+                <h3>🤖 ML Security Engine</h3>
                 <div class="ml-status-container">
                     <div class="ml-status-main">
                         <div class="status-indicator-large">
@@ -1249,11 +1394,11 @@
                         </div>
                         <div class="ml-controls">
                             <button class="button button-primary" onclick="initializeML()" id="ml-init-btn">
-                                <span class="button-icon"></span>Initialize ML Engine
+                                <span class="button-icon">🔄</span>Initialize ML Engine
                             </button>
                             <button class="button button-primary" id="ml-monitoring-toggle"
                                 onclick="toggleMLMonitoring()">
-                                <span class="button-icon"></span>Pause Monitoring
+                                <span class="button-icon">⏸️</span>Pause Monitoring
                             </button>
                         </div>
                     </div>
@@ -1263,31 +1408,31 @@
             <!-- Statistics Grid -->
             <div class="grid-container">
                 <div class="card">
-                    <h3>Network Statistics</h3>
+                    <h3>📊 Network Statistics</h3>
                     <div class="stats-grid">
                         <div class="stat-item">
-                            <div class="stat-icon"></div>
+                            <div class="stat-icon">📦</div>
                             <div class="stat-content">
                                 <div class="stat-value" id="total-packets">0</div>
                                 <div class="stat-label">Total Packets</div>
                             </div>
                         </div>
                         <div class="stat-item">
-                            <div class="stat-icon"></div>
+                            <div class="stat-icon">⚠️</div>
                             <div class="stat-content">
                                 <div class="stat-value" id="attack-packets">0</div>
                                 <div class="stat-label">Attack Packets</div>
                             </div>
                         </div>
                         <div class="stat-item">
-                            <div class="stat-icon"></div>
+                            <div class="stat-icon">📈</div>
                             <div class="stat-content">
                                 <div class="stat-value" id="attack-rate">0%</div>
                                 <div class="stat-label">Attack Rate</div>
                             </div>
                         </div>
                         <div class="stat-item">
-                            <div class="stat-icon"></div>
+                            <div class="stat-icon">🎯</div>
                             <div class="stat-content">
                                 <div class="stat-value" id="model-confidence">0%</div>
                                 <div class="stat-label">Model Confidence</div>
@@ -1297,7 +1442,7 @@
                 </div>
 
                 <div class="card">
-                    <h3>System Metrics</h3>
+                    <h3>⏱️ System Metrics</h3>
                     <div class="metrics-container">
                         <div class="metric-row">
                             <span class="metric-label">Uptime:</span>
@@ -1321,7 +1466,7 @@
 
             <!-- Attack Detection Section -->
             <div class="card">
-                <h3>Real-time Attack Detection</h3>
+                <h3>🚨 Real-time Attack Detection</h3>
                 <div class="detection-header">
                     <div class="detection-filters">
                         <button class="filter-btn active" data-filter="all">All</button>
@@ -1344,23 +1489,23 @@
         <section id="trust" class="tab-content">
             <div class="grid-container">
                 <div class="card">
-                    <h3>Average Trust Score</h3>
+                    <h3>⭐ Average Trust Score</h3>
                     <div class="metric-value" id="avg-trust-score">0</div>
                     <div class="metric-label">Network Trust Level</div>
                 </div>
                 <div class="card">
-                    <h3>Trusted Devices</h3>
+                    <h3>✅ Trusted Devices</h3>
                     <div class="metric-value" id="trusted-devices-count">0</div>
                     <div class="metric-label">Score ≥ 70</div>
                 </div>
                 <div class="card">
-                    <h3>Suspicious Devices</h3>
+                    <h3>⚠️ Suspicious Devices</h3>
                     <div class="metric-value" id="suspicious-devices-count">0</div>
                     <div class="metric-label">Score < 50</div>
                     </div>
                 </div>
                 <div class="card">
-                    <h3>Device Trust Scores</h3>
+                    <h3>📊 Device Trust Scores</h3>
                     <div class="scroll-container">
                         <table class="device-table">
                             <thead>
@@ -1382,29 +1527,29 @@
         <section id="honeypot" class="tab-content">
             <div class="grid-container">
                 <div class="card">
-                    <h3>Honeypot Status</h3>
+                    <h3>🍯 Honeypot Status</h3>
                     <div class="metric-value" id="honeypot-status">Stopped</div>
                     <div class="metric-label" id="honeypot-status-label">Container Status</div>
                 </div>
                 <div class="card">
-                    <h3>Threats Captured</h3>
+                    <h3>🎯 Threats Captured</h3>
                     <div class="metric-value" id="threats-captured">0</div>
                     <div class="metric-label">Total Threats</div>
                 </div>
                 <div class="card">
-                    <h3>Blocked IPs</h3>
+                    <h3>🚫 Blocked IPs</h3>
                     <div class="metric-value" id="blocked-ips-count">0</div>
                     <div class="metric-label">Auto-Blocked</div>
                 </div>
             </div>
             <div class="card">
-                <h3>Recent Threats</h3>
+                <h3>🔍 Recent Threats</h3>
                 <div class="scroll-container">
                     <div id="recent-threats-list" class="alerts-list"></div>
                 </div>
             </div>
             <div class="card">
-                <h3>Mitigation Rules</h3>
+                <h3>🛡️ Mitigation Rules</h3>
                 <div class="scroll-container">
                     <table class="device-table">
                         <thead>
@@ -1425,33 +1570,33 @@
         <section id="certificates" class="tab-content">
             <div class="grid-container">
                 <div class="card">
-                    <h3>Certificate Overview</h3>
+                    <h3>🔐 Certificate Overview</h3>
                     <div class="stats-grid">
                         <div class="stat-item">
-                            <div class="stat-icon"></div>
+                            <div class="stat-icon">📜</div>
                             <div class="stat-content">
-                                <div class="stat-value" id="total-certificates">0</div>
+                                <div class="stat-value" id="certificates-total">0</div>
                                 <div class="stat-label">Total Certificates</div>
                             </div>
                         </div>
                         <div class="stat-item">
-                            <div class="stat-icon"></div>
+                            <div class="stat-icon">✅</div>
                             <div class="stat-content">
-                                <div class="stat-value" id="valid-certificates">0</div>
+                                <div class="stat-value" id="certificates-valid">0</div>
                                 <div class="stat-label">Valid</div>
                             </div>
                         </div>
                         <div class="stat-item">
-                            <div class="stat-icon"></div>
+                            <div class="stat-icon">⚠️</div>
                             <div class="stat-content">
-                                <div class="stat-value" id="expiring-certificates">0</div>
+                                <div class="stat-value" id="certificates-expiring">0</div>
                                 <div class="stat-label">Expiring Soon</div>
                             </div>
                         </div>
                         <div class="stat-item">
-                            <div class="stat-icon"></div>
+                            <div class="stat-icon">❌</div>
                             <div class="stat-content">
-                                <div class="stat-value" id="expired-certificates">0</div>
+                                <div class="stat-value" id="certificates-expired">0</div>
                                 <div class="stat-label">Expired</div>
                             </div>
                         </div>
@@ -1481,24 +1626,24 @@
         <section id="analytics" class="tab-content">
             <div class="grid-container">
                 <div class="card">
-                    <h3>Network Performance</h3>
+                    <h3>📈 Network Performance</h3>
                     <div class="stats-grid">
                         <div class="stat-item">
-                            <div class="stat-icon"></div>
+                            <div class="stat-icon">📦</div>
                             <div class="stat-content">
                                 <div class="stat-value" id="analytics-total-packets">0</div>
                                 <div class="stat-label">Total Packets</div>
                             </div>
                         </div>
                         <div class="stat-item">
-                            <div class="stat-icon"></div>
+                            <div class="stat-icon">⚡</div>
                             <div class="stat-content">
                                 <div class="stat-value" id="analytics-packets-per-min">0</div>
                                 <div class="stat-label">Packets/Min</div>
                             </div>
                         </div>
                         <div class="stat-item">
-                            <div class="stat-icon"></div>
+                            <div class="stat-icon">🌐</div>
                             <div class="stat-content">
                                 <div class="stat-value" id="analytics-online-devices">0</div>
                                 <div class="stat-label">Online Devices</div>
@@ -1507,7 +1652,7 @@
                     </div>
                 </div>
                 <div class="card">
-                    <h3>System Metrics</h3>
+                    <h3>⚙️ System Metrics</h3>
                     <div class="metrics-container">
                         <div class="metric-row">
                             <span class="metric-label">System Health:</span>
@@ -1529,7 +1674,7 @@
                 </div>
             </div>
             <div class="card">
-                <h3>Traffic Analysis</h3>
+                <h3>📊 Traffic Analysis</h3>
                 <div class="scroll-container">
                     <div id="traffic-analysis">
                         <div class="loading-indicator">Loading traffic analysis...</div>
@@ -1540,25 +1685,41 @@
 
         <!-- Device Approval Tab -->
         <section id="approval" class="tab-content">
-            <div class="grid-container">
-                <div class="card">
-                    <h3>Pending Approvals</h3>
-                    <div class="metric-value" id="pending-count">0</div>
-                    <div class="metric-label">Devices Awaiting Review</div>
-                </div>
-                <div class="card">
-                    <h3>Approved Today</h3>
-                    <div class="metric-value" id="approved-today">0</div>
-                    <div class="metric-label">Devices Approved</div>
-                </div>
-                <div class="card">
-                    <h3>Rejected Today</h3>
-                    <div class="metric-value" id="rejected-today">0</div>
-                    <div class="metric-label">Devices Rejected</div>
+            <div class="card">
+                <h3>📊 Device Approval Overview</h3>
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="stat-icon">⏳</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="pending-count">0</div>
+                            <div class="stat-label">Pending Approvals</div>
+                        </div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-icon">✅</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="approved-today">0</div>
+                            <div class="stat-label">Approved Today</div>
+                        </div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-icon">❌</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="rejected-today">0</div>
+                            <div class="stat-label">Rejected Today</div>
+                        </div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-icon">📋</div>
+                        <div class="stat-content">
+                            <div class="stat-value" id="total-processed">0</div>
+                            <div class="stat-label">Total Processed</div>
+                        </div>
+                    </div>
                 </div>
             </div>
             <div class="card" style="margin-top: 1rem;">
-                <h3>Pending Device Approvals</h3>
+                <h3>📋 Pending Device Approvals</h3>
                 <p style="color: var(--text-secondary); margin-bottom: 1rem;">
                     New devices detected on the WiFi network are listed below. Review and approve or reject each device.
                 </p>
@@ -1567,7 +1728,11 @@
                 </div>
             </div>
             <div class="card" style="margin-top: 1rem;">
-                <h3>Device Approval History</h3>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                    <h3 style="margin-bottom: 0;">📜 Device Approval History</h3>
+                    <button class="button button-danger" onclick="clearDeviceHistory()"
+                        style="padding: 0.25rem 0.75rem; font-size: 0.875rem;">Clear History</button>
+                </div>
                 <div id="device-history-container" class="scroll-container">
                     <div class="loading-indicator">Loading history...</div>
                 </div>
@@ -1594,6 +1759,8 @@
                     // Call appropriate update functions based on active tab
                     if (targetId === 'overview') {
                         updateOverviewStatistics();
+                    } else if (targetId === 'devices') {
+                        loadDevicesList();
                     } else if (targetId === 'security') {
                         updatePolicyLogs();
                         updateSecurityAlerts();
@@ -1605,6 +1772,10 @@
                         updateTrustScores();
                     } else if (targetId === 'honeypot') {
                         updateHoneypotStatus();
+                    } else if (targetId === 'approval') {
+                        loadPendingDevices();
+                        loadDeviceHistory();
+                        loadFailedTokenRequests();
                     } else if (targetId === 'certificates') {
                         updateCertificates();
                     } else if (targetId === 'analytics') {
@@ -1668,12 +1839,26 @@
                         type: 'continuous'
                     }
                 },
+                interaction: {
+                    dragNodes: true,
+                    dragView: true,
+                    zoomView: true,
+                    hover: true
+                },
                 physics: {
-                    stabilization: false,
+                    enabled: true,
+                    stabilization: {
+                        enabled: true,
+                        iterations: 150,
+                        updateInterval: 25,
+                        fit: true
+                    },
                     barnesHut: {
-                        gravitationalConstant: -80000,
-                        springConstant: 0.001,
-                        springLength: 200
+                        gravitationalConstant: -3000,
+                        centralGravity: 0.3,
+                        springConstant: 0.04,
+                        springLength: 150,
+                        damping: 0.09
                     }
                 },
                 groups: {
@@ -1705,38 +1890,51 @@
                             }
                         }
                     },
-                    revoked: {
+                    untrusted: {
                         color: {
-                            border: '#8b0000',
-                            background: '#dc143c',
+                            border: '#d50000',
+                            background: '#ff1744',
                             highlight: {
-                                border: '#8b0000',
-                                background: '#ff4747'
+                                border: '#d50000',
+                                background: '#ff5252'
                             },
                             hover: {
-                                border: '#8b0000',
-                                background: '#ff4747'
+                                border: '#d50000',
+                                background: '#ff5252'
                             }
-                        }
+                        },
+                        borderWidth: 3,
+                        borderWidthSelected: 4
                     },
-                    honeypot: {
+                    suspicious: {
                         color: {
-                            border: '#ff8c00',
-                            background: '#ffd700',
+                            border: '#e65100',
+                            background: '#ff9800',
                             highlight: {
-                                border: '#ff8c00',
-                                background: '#ffed4e'
+                                border: '#e65100',
+                                background: '#ffb74d'
                             },
                             hover: {
-                                border: '#ff8c00',
-                                background: '#ffed4e'
+                                border: '#e65100',
+                                background: '#ffb74d'
                             }
                         }
                     }
                 }
             };
 
-            return new vis.Network(container, { nodes: new vis.DataSet(), edges: new vis.DataSet() }, options);
+            // Initialize DataSets globally for stability
+            window.networkNodes = new vis.DataSet();
+            window.networkEdges = new vis.DataSet();
+
+            const net = new vis.Network(container, { nodes: window.networkNodes, edges: window.networkEdges }, options);
+
+            // Once the layout is stabilized, turn off physics so nodes stay put
+            net.once('stabilizationIterationsDone', function () {
+                net.setOptions({ physics: { enabled: false } });
+            });
+
+            return net;
         }
 
         let network = initializeNetwork();
@@ -1766,6 +1964,11 @@
                 updateOverviewStatistics();
             }
 
+            // Update devices list if devices tab is active
+            if (document.getElementById('devices').classList.contains('active')) {
+                loadDevicesList();
+            }
+
             // Update security section if active
             if (document.getElementById('security').classList.contains('active')) {
                 updatePolicyLogs();
@@ -1791,8 +1994,10 @@
                 updateAnalytics();
             }
 
-            // Always update trust scores (not just when tab is active)
-            updateTrustScores();
+            // Update trust scores if active
+            if (document.getElementById('trust').classList.contains('active')) {
+                updateTrustScores();
+            }
 
             // Update honeypot if active
             if (document.getElementById('honeypot').classList.contains('active')) {
@@ -1925,6 +2130,24 @@
                     }
                 })
                 .catch(() => { });
+
+            // Update trust score overview
+            fetch('/api/trust_scores')
+                .then(response => response.json())
+                .then(data => {
+                    const scores = data.scores || {};
+                    const scoresList = Object.values(scores);
+                    const avgScore = scoresList.length > 0
+                        ? Math.round(scoresList.reduce((sum, s) => sum + s, 0) / scoresList.length)
+                        : 0;
+                    const overviewAvgTrust = document.getElementById('overview-avg-trust');
+                    const overviewTrustedCount = document.getElementById('overview-trusted-count');
+                    const overviewSuspiciousCount = document.getElementById('overview-suspicious-count');
+                    if (overviewAvgTrust) overviewAvgTrust.textContent = avgScore;
+                    if (overviewTrustedCount) overviewTrustedCount.textContent = scoresList.filter(s => s >= 70).length;
+                    if (overviewSuspiciousCount) overviewSuspiciousCount.textContent = scoresList.filter(s => s < 50).length;
+                })
+                .catch(() => { });
         }
 
         function updateDeviceTable(data) {
@@ -1932,88 +2155,241 @@
             Object.entries(data).forEach(([deviceId, info]) => {
                 const packetsEl = document.getElementById(`packets-${deviceId}`);
                 const rateLimitEl = document.getElementById(`rate-limit-${deviceId}`);
-                const packetsPerMinEl = document.getElementById(`packets-per-min-${deviceId}`);
-                const lastSeenEl = document.getElementById(`last-seen-${deviceId}`);
+                const statusBadgeEl = document.getElementById(`status-${deviceId}`);
 
                 if (packetsEl) packetsEl.textContent = info.packets;
                 if (rateLimitEl) rateLimitEl.textContent = info.rate_limit_status;
-                if (packetsPerMinEl) packetsPerMinEl.textContent = info.packets_per_minute || 0;
 
-                // Format last_seen as a readable timestamp
-                if (lastSeenEl) {
-                    if (info.last_seen && info.last_seen > 0) {
-                        const lastSeenDate = new Date(info.last_seen * 1000);
-                        const now = new Date();
-                        const diffSeconds = Math.floor((now - lastSeenDate) / 1000);
-
-                        if (diffSeconds < 60) {
-                            lastSeenEl.textContent = `${diffSeconds}s ago`;
-                        } else if (diffSeconds < 3600) {
-                            lastSeenEl.textContent = `${Math.floor(diffSeconds / 60)}m ago`;
-                        } else if (diffSeconds < 86400) {
-                            lastSeenEl.textContent = `${Math.floor(diffSeconds / 3600)}h ago`;
-                        } else {
-                            lastSeenEl.textContent = lastSeenDate.toLocaleString();
-                        }
+                if (statusBadgeEl) {
+                    const isOnline = info.online === true || info.status === 'active' || info.status === 'online';
+                    statusBadgeEl.className = `status-badge ${isOnline ? 'authorized' : 'unauthorized'}`;
+                    statusBadgeEl.textContent = isOnline ? 'Online' : 'Offline';
+                    if (isOnline) {
+                        statusBadgeEl.style.backgroundColor = 'rgba(16, 185, 129, 0.1)';
+                        statusBadgeEl.style.color = '#10b981';
+                        statusBadgeEl.style.borderColor = 'rgba(16, 185, 129, 0.2)';
                     } else {
-                        lastSeenEl.textContent = '--';
+                        statusBadgeEl.style.backgroundColor = 'rgba(239, 68, 68, 0.1)';
+                        statusBadgeEl.style.color = '#ef4444';
+                        statusBadgeEl.style.borderColor = 'rgba(239, 68, 68, 0.2)';
                     }
                 }
             });
         }
 
+        function loadDevicesList() {
+            // Load devices from topology and network statistics
+            Promise.all([
+                fetch('/get_topology_with_mac').then(r => r.json()),
+                fetch('/get_health_metrics').then(r => r.json()),
+                fetch('/api/network/statistics').then(r => r.json()),
+                fetch('/api/trust_scores').then(r => r.json())
+            ]).then(([topologyData, healthData, networkStats, trustScoresData]) => {
+                const tbody = document.getElementById('device-list');
+                if (!tbody) return;
+
+                // Extract trust scores
+                const trustScores = trustScoresData.scores || {};
+
+                let html = '';
+                const devices = topologyData.nodes || [];
+
+                // Filter out gateway node
+                const deviceNodes = devices.filter(node => node.type !== 'gateway');
+
+                // Update device statistics
+                const totalDevices = deviceNodes.length;
+                const onlineDevices = deviceNodes.filter(d => d.online === true || d.status === 'active').length;
+                const offlineDevices = totalDevices - onlineDevices;
+                const totalPackets = deviceNodes.reduce((sum, d) => sum + (d.packets || 0), 0);
+
+                document.getElementById('devices-total-count').textContent = totalDevices;
+                document.getElementById('devices-online-count').textContent = onlineDevices;
+                document.getElementById('devices-total-packets').textContent = totalPackets;
+
+                // Get network statistics for packets per minute
+                const stats = networkStats.statistics || {};
+                const deviceStats = stats.devices || {};
+
+                // Build device rows
+                deviceNodes.forEach(device => {
+                    const deviceId = device.id;
+                    // Check availability from both topology and health data
+                    const isOnline = device.online === true || device.status === 'active' ||
+                        (healthData[deviceId] && (healthData[deviceId].online === true || healthData[deviceId].status === 'online'));
+
+                    const statusClass = isOnline ? 'authorized' : 'unauthorized';
+                    const statusText = isOnline ? 'Online' : 'Offline';
+                    const statusStyle = isOnline ?
+                        "background: rgba(16, 185, 129, 0.1); color: #10b981; border-color: rgba(16, 185, 129, 0.2);" :
+                        "background: rgba(239, 68, 68, 0.1); color: #ef4444; border-color: rgba(239, 68, 68, 0.2);";
+
+                    // Get authorization status (check if device is in authorized list)
+                    // We need to check if 'authorized' field exists in device object or healthData
+                    const isAuthorized = device.authorized === true || (healthData[deviceId] && healthData[deviceId].authorized === true);
+                    const authClass = isAuthorized ? 'authorized' : 'unauthorized';
+                    const authText = isAuthorized ? 'Authorized' : 'Unauthorized';
+
+                    // Get packet counts
+                    const packets = device.packets || 0;
+                    const deviceStat = deviceStats[deviceId] || {};
+                    const packetsPerMin = deviceStat.packets_per_minute || 0;
+
+                    // Format last seen time
+                    let lastSeenText = 'Never';
+                    if (device.last_seen && device.last_seen > 0) {
+                        const lastSeenDate = new Date(device.last_seen * 1000);
+                        const now = new Date();
+                        const diffSeconds = Math.floor((now - lastSeenDate) / 1000);
+
+                        if (diffSeconds < 60) {
+                            lastSeenText = `${diffSeconds}s ago`;
+                        } else if (diffSeconds < 3600) {
+                            lastSeenText = `${Math.floor(diffSeconds / 60)}m ago`;
+                        } else {
+                            lastSeenText = lastSeenDate.toLocaleTimeString();
+                        }
+                    }
+
+                    // Certificate status
+                    const hasCert = device.onboarded === true;
+                    const certClass = hasCert ? 'authorized' : 'unauthorized';
+                    const certText = hasCert ? 'Verified' : 'None';
+
+                    // Calculate trust score display — use ?? to preserve score of 0
+                    const trustScore = (trustScores[deviceId] !== undefined && trustScores[deviceId] !== null) ? trustScores[deviceId] : 70;
+                    let trustColor = '#10b981'; // Green for high
+                    let trustBg = 'rgba(16, 185, 129, 0.1)';
+                    let trustLevel = 'Trusted';
+                    if (trustScore < 30) {
+                        trustColor = '#ef4444'; // Red
+                        trustBg = 'rgba(239, 68, 68, 0.1)';
+                        trustLevel = 'Untrusted';
+                    } else if (trustScore < 50) {
+                        trustColor = '#f97316'; // Orange
+                        trustBg = 'rgba(249, 115, 22, 0.1)';
+                        trustLevel = 'Suspicious';
+                    } else if (trustScore < 70) {
+                        trustColor = '#eab308'; // Yellow
+                        trustBg = 'rgba(234, 179, 8, 0.1)';
+                        trustLevel = 'Monitored';
+                    }
+
+                    html += `
+                        <tr>
+                            <td><strong>${deviceId}</strong></td>
+                            <td>
+                                <span class="status-badge ${statusClass}" id="status-${deviceId}" style="${statusStyle}">
+                                    ${statusText}
+                                </span>
+                            </td>
+                            <td>
+                                <span class="status-badge ${certClass}" style="background: ${hasCert ? 'rgba(16, 185, 129, 0.1)' : 'rgba(148, 163, 184, 0.1)'}; color: ${hasCert ? '#10b981' : '#94a3b8'}; border-color: ${hasCert ? 'rgba(16, 185, 129, 0.2)' : 'rgba(148, 163, 184, 0.2)'};">
+                                    ${certText}
+                                </span>
+                            </td>
+                            <td id="packets-${deviceId}">${packets}</td>
+                            <td id="packets-per-min-${deviceId}">${packetsPerMin}</td>
+                            <td id="trust-score-${deviceId}">
+                                <span class="status-badge" style="background: ${trustBg}; color: ${trustColor}; border-color: ${trustColor}20;">
+                                    ${trustScore} - ${trustLevel}
+                                </span>
+                            </td>
+                            <td id="last-seen-${deviceId}">${lastSeenText}</td>
+                            <td>
+                                <button class="button button-danger" onclick="removeDevice('${deviceId}')" style="margin-left: 0.5rem; background-color: #d32f2f;">
+                                    Delete
+                                </button>
+                            </td>
+                        </tr>
+                    `;
+                });
+
+                if (deviceNodes.length === 0) {
+                    html = '<tr><td colspan="8" style="text-align: center; padding: 2rem; color: var(--text-secondary);">No devices found</td></tr>';
+                }
+
+                tbody.innerHTML = html;
+            }).catch(err => {
+                console.error('Error loading devices list:', err);
+                const tbody = document.getElementById('device-list');
+                if (tbody) {
+                    tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 2rem; color: var(--danger-color);">Error loading devices</td></tr>';
+                }
+            });
+        }
+
+        function toggleDeviceAuthorization(deviceId, authorize) {
+            const action = authorize ? 'authorize' : 'revoke';
+            fetch('/api/authorize_device', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    device_id: deviceId,
+                    action: action
+                })
+            }).then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        // Reload devices list after a short delay to ensure backend has updated
+                        setTimeout(() => {
+                            loadDevicesList();
+                        }, 100);
+                    } else {
+                        alert('Failed to ' + action + ' device: ' + (data.message || 'Unknown error'));
+                    }
+                }).catch(err => {
+                    console.error('Error toggling device authorization:', err);
+                    alert('Error updating device authorization');
+                });
+        }
+
         function updateTopology(data) {
-            // Enhanced topology processing: set group based on status, connection, and honeypot status
+            // Enhanced topology processing: set group based on trust level and connection
             const nodes = data.nodes.map(node => {
-                // Check if device is revoked
-                if (node.status === 'revoked') {
-                    return {
-                        ...node,
-                        group: 'revoked',
-                        title: `${node.label}<br>Status: REVOKED<br>Connection: Disconnected<br>Last Seen: ${new Date(node.last_seen * 1000).toLocaleTimeString()}`,
-                        size: node.type === 'gateway' ? 40 : 30,
-                        font: {
-                            size: 14,
-                            color: '#ffffff',
-                            face: 'Inter'
-                        }
-                    };
-                }
-                
-                // Check if device is redirected to honeypot
-                if (node.honeypot_redirected) {
-                    return {
-                        ...node,
-                        group: 'honeypot',
-                        title: `${node.label}<br>Status: HONEYPOT REDIRECTED<br>Connection: ${node.online ? 'Connected' : 'Disconnected'}<br>Last Seen: ${new Date(node.last_seen * 1000).toLocaleTimeString()}`,
-                        size: node.type === 'gateway' ? 40 : 30,
-                        font: {
-                            size: 14,
-                            color: '#000000',
-                            face: 'Inter',
-                            bold: {
-                                color: '#000000'
-                            }
-                        }
-                    };
-                }
-                
-                // Regular device logic: green for connected/active devices, red for inactive
-                const isOnline = node.online === true || node.status === 'active';
+                // Use only the live online flag (10s timeout), not DB status
+                const isOnline = node.online === true;
                 const hasEdge = Array.isArray(data.edges) && data.edges.some(edge =>
                     edge.from === node.id || edge.to === node.id
                 );
-                // Gateway is always connected, devices are connected if online and have edge
                 const isConnected = node.type === 'gateway' || (isOnline && hasEdge);
 
-                // Determine group: green for connected/active devices, red for inactive
-                const group = isConnected ? 'active' : 'inactive';
+                // Determine group based on trust level
+                let group = 'active';
+                const trustLevel = node.trust_level || 'trusted';
+                const isRedirected = node.redirected_to_honeypot === true;
+
+                if (isRedirected || trustLevel === 'untrusted') {
+                    group = 'untrusted';  // Red pulsing circle, detached
+                } else if (trustLevel === 'suspicious') {
+                    group = 'suspicious';  // Orange circle
+                } else if (!isConnected) {
+                    group = 'inactive';  // Red circle (offline)
+                }
+
+                // Build tooltip with trust info
+                const trustScore = node.trust_score !== undefined ? node.trust_score : '--';
+                let trustBadge = isRedirected ? '\n🍯 REDIRECTED TO HONEYPOT' : '';
+
+                // Explicit color per group — vis.js caches inline colors,
+                // so changing group alone doesn't repaint the node
+                const groupColors = {
+                    active: { border: '#1b5e20', background: '#4caf50', highlight: { border: '#1b5e20', background: '#66bb6a' }, hover: { border: '#1b5e20', background: '#66bb6a' } },
+                    inactive: { border: '#b71c1c', background: '#f44336', highlight: { border: '#b71c1c', background: '#ef5350' }, hover: { border: '#b71c1c', background: '#ef5350' } },
+                    untrusted: { border: '#d50000', background: '#ff1744', highlight: { border: '#d50000', background: '#ff5252' }, hover: { border: '#d50000', background: '#ff5252' } },
+                    suspicious: { border: '#e65100', background: '#ff9800', highlight: { border: '#e65100', background: '#ffb74d' }, hover: { border: '#e65100', background: '#ffb74d' } }
+                };
 
                 return {
-                    ...node,
+                    id: node.id,
+                    label: node.label,
                     group: group,
-                    title: `${node.label}<br>Status: ${node.status || (node.online ? 'active' : 'inactive')}<br>Connection: ${isConnected ? 'Connected' : 'Disconnected'}<br>Last Seen: ${new Date(node.last_seen * 1000).toLocaleTimeString()}`,
-                    size: node.type === 'gateway' ? 40 : 30,
+                    color: groupColors[group] || groupColors.active,
+                    borderWidth: group === 'untrusted' ? 3 : 1,
+                    title: `${node.label}<br>Status: ${node.status || (node.online ? 'active' : 'inactive')}<br>Connection: ${isConnected ? 'Connected' : 'Disconnected'}<br>Trust: ${trustScore} (${trustLevel})<br>Last Seen: ${new Date(node.last_seen * 1000).toLocaleTimeString()}${trustBadge ? '<br>' + trustBadge : ''}`,
+                    size: node.type === 'gateway' ? 40 : (group === 'untrusted' ? 35 : 30),
                     font: {
                         size: 14,
                         color: '#ffffff',
@@ -2044,10 +2420,48 @@
                 }
             })) : [];
 
-            network.setData({
-                nodes: new vis.DataSet(nodes),
-                edges: new vis.DataSet(edges)
-            });
+            // Incrementally update DataSets — only re-run physics if new nodes appear
+            if (window.networkNodes && window.networkEdges) {
+                const currentNodeIds = window.networkNodes.getIds();
+                const newNodeIds = nodes.map(n => n.id);
+
+                // Remove nodes that are no longer present
+                const nodesToRemove = currentNodeIds.filter(id => !newNodeIds.includes(id));
+                window.networkNodes.remove(nodesToRemove);
+
+                // Detect truly new nodes (not just updates)
+                const addedNodes = newNodeIds.filter(id => !currentNodeIds.includes(id));
+
+                // Update all node properties (color, group, label, etc.)
+                window.networkNodes.update(nodes);
+
+                // Smart edge update: build a key set to avoid clear/add churn
+                const currentEdgeKeys = new Set(
+                    window.networkEdges.get().map(e => e.from + '->' + e.to)
+                );
+                const newEdgeKeys = new Set(edges.map(e => e.from + '->' + e.to));
+                const edgesChanged = currentEdgeKeys.size !== newEdgeKeys.size ||
+                    [...newEdgeKeys].some(k => !currentEdgeKeys.has(k));
+
+                if (edgesChanged) {
+                    window.networkEdges.clear();
+                    window.networkEdges.add(edges);
+                }
+
+                // Only re-stabilize layout when brand-new nodes appear
+                if (addedNodes.length > 0 || nodesToRemove.length > 0) {
+                    network.setOptions({ physics: { enabled: true } });
+                    network.once('stabilizationIterationsDone', function () {
+                        network.setOptions({ physics: { enabled: false } });
+                    });
+                    network.stabilize(100);
+                }
+            } else {
+                network.setData({
+                    nodes: new vis.DataSet(nodes),
+                    edges: new vis.DataSet(edges)
+                });
+            }
         }
 
         function updateHealthMetrics(data) {
@@ -2203,7 +2617,7 @@
                             </div>
                             <div class="alert-message">${alert.message}</div>
                             ${alert.device ? `<div class="alert-device">Device: ${alert.device}</div>` : ''}
-                            ${isRedirected ? `<div class="alert-honeypot">Redirected to honeypot${activityCount > 0 ? ` (${activityCount} activities logged)` : ''}</div>` : ''}
+                            ${isRedirected ? `<div class="alert-honeypot">🔴 Redirected to honeypot${activityCount > 0 ? ` (${activityCount} activities logged)` : ''}</div>` : ''}
                         </div>
                     `;
                     }).join('');
@@ -2237,8 +2651,6 @@
         }
 
         // ML Engine Functions
-        const MAX_ML_RETRIES = 3;  // Maximum number of retries for ML detection updates
-        let mlDetectionRetryCount = 0;  // Current retry count
         let mlMonitoringActive = true;
         let currentFilter = 'all';
 
@@ -2381,7 +2793,7 @@
                     if (!detections || detections.length === 0) {
                         container.innerHTML = `
                         <div class="detection-item normal">
-                            <div class="detection-icon"></div>
+                            <div class="detection-icon">✅</div>
                             <div class="detection-content">
                                 <div class="detection-header-row">
                                     <span class="detection-type">No Threats Detected</span>
@@ -2406,7 +2818,7 @@
 
                         container.innerHTML = recentDetections.map(detection => {
                             const isAttack = detection.is_attack;
-                            const icon = isAttack ? '' : '';
+                            const icon = isAttack ? '🚨' : '✅';
                             const type = detection.attack_type || 'Normal Traffic';
                             const confidence = Number(detection.confidence) * 100;
                             const timestamp = detection.timestamp ? new Date(detection.timestamp).toLocaleTimeString() : '';
@@ -2431,7 +2843,7 @@
                                         <div class="detection-device">Device: ${device}</div>
                                         ${isAttack ? `
                                             <div class="attack-details">
-                                                <strong>Attack Details:</strong>
+                                                <strong>⚠️ Attack Details:</strong>
                                                 <ul style="margin: 0.5rem 0; padding-left: 1rem;">
                                                     <li>Attack Type: ${type}</li>
                                                     <li>Confidence Level: ${confidence.toFixed(1)}%</li>
@@ -2459,7 +2871,7 @@
                         setTimeout(() => updateMLDetections(true), 2000 * mlDetectionRetryCount);
                         container.innerHTML = `
                         <div class="detection-item normal">
-                            <div class="detection-icon"></div>
+                            <div class="detection-icon">🔄</div>
                             <div class="detection-content">
                                 <div class="detection-header-row">
                                     <span class="detection-type">Reconnecting to ML Engine...</span>
@@ -2473,7 +2885,7 @@
                     } else {
                         container.innerHTML = `
                         <div class="detection-item attack">
-                            <div class="detection-icon"></div>
+                            <div class="detection-icon">❌</div>
                             <div class="detection-content">
                                 <div class="detection-header-row">
                                     <span class="detection-type">ML Engine Connection Error</span>
@@ -2496,13 +2908,13 @@
             const statusSubtitle = document.getElementById('ml-status-subtitle');
 
             if (mlMonitoringActive) {
-                button.innerHTML = '<span class="button-icon"></span>Pause Monitoring';
+                button.innerHTML = '<span class="button-icon">⏸️</span>Pause Monitoring';
                 statusDot.className = 'status-dot-large active';
                 statusText.textContent = 'Active - Monitoring';
                 statusSubtitle.textContent = 'ML model loaded and monitoring network traffic';
                 startMLUpdates();
             } else {
-                button.innerHTML = '<span class="button-icon"></span>Resume Monitoring';
+                button.innerHTML = '<span class="button-icon">▶️</span>Resume Monitoring';
                 statusDot.className = 'status-dot-large';
                 statusText.textContent = 'Paused';
                 statusSubtitle.textContent = 'Monitoring paused by user';
@@ -2663,37 +3075,21 @@
 
         // Trust Scores Update Functions
         function updateTrustScores() {
-            console.log('[Trust Scores] Fetching from /api/trust_scores...');
             fetch('/api/trust_scores')
-                .then(response => {
-                    // Check if response is JSON
-                    const contentType = response.headers.get('content-type');
-                    console.log('[Trust Scores] Response status:', response.status, 'Content-Type:', contentType);
-                    if (!response.ok || !contentType || !contentType.includes('application/json')) {
-                        // API endpoint not implemented or returned error - fail silently
-                        console.warn('[Trust Scores] Invalid response, skipping update');
-                        return null;
-                    }
-                    return response.json();
-                })
+                .then(response => response.json())
                 .then(data => {
-                    console.log('[Trust Scores] Received data:', data);
-                    if (!data) return;  // Skip if endpoint not available
                     const scores = data.scores || {};
                     const scoresList = Object.entries(scores);
-                    console.log('[Trust Scores] Scores list:', scoresList);
 
                     // Calculate average
                     const avgScore = scoresList.length > 0
                         ? Math.round(scoresList.reduce((sum, [_, score]) => sum + score, 0) / scoresList.length)
                         : 0;
-                    console.log('[Trust Scores] Average score:', avgScore);
                     document.getElementById('avg-trust-score').textContent = avgScore;
 
                     // Count trusted and suspicious devices
                     const trusted = scoresList.filter(([_, score]) => score >= 70).length;
                     const suspicious = scoresList.filter(([_, score]) => score < 50).length;
-                    console.log('[Trust Scores] Trusted:', trusted, 'Suspicious:', suspicious);
                     document.getElementById('trusted-devices-count').textContent = trusted;
                     document.getElementById('suspicious-devices-count').textContent = suspicious;
 
@@ -2728,11 +3124,9 @@
                             </tr>
                         `;
                     }).join('');
-                    console.log('[Trust Scores] Table updated with', scoresList.length, 'devices');
                 })
                 .catch(error => {
-                    // Silently fail - endpoint may not be implemented yet
-                    console.error('[Trust Scores] Error:', error);
+                    console.error('Error fetching trust scores:', error);
                 });
         }
 
@@ -2772,8 +3166,10 @@
                     } else {
                         threatsList.innerHTML = threats.slice(-10).reverse().map(threat => `
                             <div class="alert ${threat.severity || 'medium'}">
-                                <strong>${threat.event_type || 'Unknown'}</strong><br>
-                                <small>IP: ${threat.source_ip || 'Unknown'}</small><br>
+                                <strong>${threat.type || threat.event_type || 'Unknown'}</strong><br>
+                                <small>Device: ${threat.device_id || threat.source_ip || 'Unknown'}</small>
+                                ${threat.trust_score !== undefined ? `<br><small>Trust Score: ${threat.trust_score} (${threat.trust_level || 'unknown'})</small>` : ''}
+                                ${threat.detection_count ? `<br><small>Detections: ${threat.detection_count}</small>` : ''}<br>
                                 <small>${threat.timestamp || ''}</small>
                             </div>
                         `).join('');
@@ -2823,42 +3219,50 @@
         // Certificates Update Functions
         function updateCertificates() {
             fetch('/api/certificates')
-                .then(response => {
-                    // Check if response is JSON
-                    const contentType = response.headers.get('content-type');
-                    if (!response.ok || !contentType || !contentType.includes('application/json')) {
-                        // API endpoint not implemented or returned error - fail silently
-                        return null;
-                    }
-                    return response.json();
-                })
+                .then(response => response.json())
                 .then(data => {
-                    if (!data) return;  // Skip if endpoint not available
-                    const certificates = data.certificates || [];
-                    document.getElementById('total-certificates').textContent = certificates.length;
+                    if (data.status === 'error') {
+                        console.error('Error fetching certificates:', data.message);
+                        return;
+                    }
 
-                    const valid = certificates.filter(c => c.status === 'valid').length;
+                    const certificates = data.certificates || [];
+
+                    // Update overview stats with correct element IDs
+                    const totalEl = document.getElementById('certificates-total');
+                    const validEl = document.getElementById('certificates-valid');
+                    const expiringEl = document.getElementById('certificates-expiring');
+                    const expiredEl = document.getElementById('certificates-expired');
+
+                    if (totalEl) totalEl.textContent = certificates.length;
+
+                    const valid = certificates.filter(c => c.status === 'valid' || c.status === 'active').length;
                     const expiring = certificates.filter(c => c.status === 'expiring').length;
-                    const expired = certificates.filter(c => c.status === 'expired').length;
-                    document.getElementById('valid-certificates').textContent = valid;
-                    document.getElementById('expiring-certificates').textContent = expiring;
-                    document.getElementById('expired-certificates').textContent = expired;
+                    const expired = certificates.filter(c => c.status === 'expired' || c.status === 'revoked').length;
+
+                    if (validEl) validEl.textContent = valid;
+                    if (expiringEl) expiringEl.textContent = expiring;
+                    if (expiredEl) expiredEl.textContent = expired;
 
                     // Update certificates table
                     const tbody = document.getElementById('certificates-list');
+                    if (!tbody) return;
+
                     if (certificates.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="5">No certificates issued</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="5">No certificates issued yet. Approve devices to generate certificates.</td></tr>';
                     } else {
                         tbody.innerHTML = certificates.map(cert => {
-                            const statusColor = cert.status === 'valid' ? '#4caf50' : '#f44336';
+                            const statusColor = (cert.status === 'valid' || cert.status === 'active') ? '#4caf50' :
+                                cert.status === 'expiring' ? '#ff9800' : '#f44336';
                             return `
                                 <tr>
-                                    <td>${cert.device_id || 'N/A'}</td>
+                                    <td><strong>${cert.device_id || 'N/A'}</strong></td>
                                     <td>${cert.mac_address || 'N/A'}</td>
-                                    <td><span style="color: ${statusColor};">${cert.status || 'unknown'}</span></td>
-                                    <td>${cert.valid_until || 'N/A'}</td>
+                                    <td><span style="color: ${statusColor};">${(cert.status || 'unknown').toUpperCase()}</span></td>
+                                    <td>${cert.valid_until || cert.expires || 'N/A'}</td>
                                     <td>
-                                        <button class="btn-small" onclick="revokeCertificate('${cert.device_id}')">Revoke</button>
+                                        <button class="button button-danger" onclick="revokeCertificate('${cert.device_id}')" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Revoke</button>
+                                        <button class="button button-danger" onclick="removeDevice('${cert.device_id}')" style="padding: 0.25rem 0.5rem; font-size: 0.75rem; background-color: #d32f2f; margin-left: 0.25rem;">Delete</button>
                                     </td>
                                 </tr>
                             `;
@@ -2866,8 +3270,11 @@
                     }
                 })
                 .catch(error => {
-                    // Silently fail - endpoint may not be implemented yet
-                    // console.debug('Certificates endpoint not available:', error);
+                    console.error('Error fetching certificates:', error);
+                    const tbody = document.getElementById('certificates-list');
+                    if (tbody) {
+                        tbody.innerHTML = '<tr><td colspan="5">Error loading certificates. Please check if the certificate system is initialized.</td></tr>';
+                    }
                 });
         }
 
@@ -2878,24 +3285,7 @@
                     .then(data => {
                         if (data.success) {
                             showAlert(`Certificate revoked for ${deviceId}`, 'success');
-                            
-                            // Refresh the certificate list
                             updateCertificates();
-                            
-                            // Refresh the topology to show device in red (revoked status)
-                            fetch('/get_topology_with_mac')
-                                .then(response => response.json())
-                                .then(topologyData => {
-                                    // Update topology with the revoked device now showing in red
-                                    updateTopology(topologyData);
-                                    // Log for debugging
-                                    console.log(`Device ${deviceId} revoked and displayed in red in topology`);
-                                })
-                                .catch(error => {
-                                    console.error('Topology refresh failed:', error);
-                                    // Still update from cache
-                                    updateData();
-                                });
                         } else {
                             showAlert(`Failed to revoke certificate: ${data.error}`, 'error');
                         }
@@ -3000,6 +3390,11 @@
                     }
 
                     const devices = data.devices || [];
+
+                    // Always update the pending count stat
+                    const pendingCountEl = document.getElementById('pending-count');
+                    if (pendingCountEl) pendingCountEl.textContent = devices.length;
+
                     if (devices.length === 0) {
                         container.innerHTML = '<div class="loading-indicator">No pending devices</div>';
                         return;
@@ -3030,6 +3425,79 @@
                 });
         }
 
+        function loadFailedTokenRequests() {
+            fetch('/api/failed_token_requests')
+                .then(resp => resp.json())
+                .then(data => {
+                    const container = document.getElementById('failed-token-requests-container');
+                    if (data.status === 'error') {
+                        container.innerHTML = `<div class="loading-indicator">${data.message || 'Error loading failed token requests'}</div>`;
+                        return;
+                    }
+
+                    if (!data.devices || data.devices.length === 0) {
+                        container.innerHTML = '<div class="loading-indicator">No devices requesting authorization. All devices are authorized or none have attempted to connect yet.</div>';
+                        return;
+                    }
+
+                    let html = '<table class="data-table"><thead><tr><th>Device ID</th><th>MAC Address</th><th>Requests</th><th>Last Request</th><th>Action</th></tr></thead><tbody>';
+
+                    data.devices.forEach(device => {
+                        const timeAgo = device.time_since_last < 60 ? `${device.time_since_last}s ago` :
+                            device.time_since_last < 3600 ? `${Math.floor(device.time_since_last / 60)}m ago` :
+                                `${Math.floor(device.time_since_last / 3600)}h ago`;
+
+                        html += `
+                            <tr>
+                                <td><strong>${device.device_id}</strong></td>
+                                <td>${device.mac_address}</td>
+                                <td>${device.request_count}</td>
+                                <td>${timeAgo}</td>
+                                <td>
+                                    <button class="button button-primary" onclick="authorizeDevice('${device.device_id}', '${device.mac_address}')">Authorize</button>
+                                </td>
+                            </tr>
+                        `;
+                    });
+
+                    html += '</tbody></table>';
+                    container.innerHTML = html;
+                })
+                .catch(err => {
+                    console.error('Error loading failed token requests:', err);
+                    document.getElementById('failed-token-requests-container').innerHTML =
+                        '<div class="loading-indicator">Error loading failed token requests</div>';
+                });
+        }
+
+        function authorizeDevice(deviceId, macAddress) {
+            if (!confirm(`Authorize device ${deviceId} (${macAddress})?\n\nThis will allow the device to request tokens and send data.`)) {
+                return;
+            }
+
+            fetch('/api/authorize_device', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    device_id: deviceId,
+                    mac_address: macAddress !== 'Unknown' ? macAddress : undefined
+                })
+            })
+                .then(resp => resp.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        alert(`Device ${deviceId} authorized successfully!\n\nThe device can now request tokens and send data.`);
+                        loadFailedTokenRequests();
+                    } else {
+                        alert('Error: ' + (data.message || 'Failed to authorize device'));
+                    }
+                })
+                .catch(err => {
+                    console.error('Error authorizing device:', err);
+                    alert('Error authorizing device');
+                });
+        }
+
         function approveDevice(macAddress, deviceId) {
             if (!confirm(`Approve device ${deviceId} (${macAddress})?`)) {
                 return;
@@ -3053,6 +3521,33 @@
                 .catch(err => {
                     console.error('Error approving device:', err);
                     alert('Error approving device');
+                });
+        }
+
+        function removeDevice(deviceId) {
+            if (!confirm(`Are you sure you want to PERMANENTLY DELETE device ${deviceId}?\n\nThis will remove all device data, certificates, and history. This action cannot be undone.`)) {
+                return;
+            }
+
+            fetch('/api/remove_device', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ device_id: deviceId })
+            })
+                .then(resp => resp.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        alert(`Device ${deviceId} permanently deleted.`);
+                        // Refresh all views
+                        updateData();
+                        loadPendingDevices();
+                    } else {
+                        alert('Error: ' + (data.message || 'Failed to remove device'));
+                    }
+                })
+                .catch(err => {
+                    console.error('Error removing device:', err);
+                    alert('Error removing device');
                 });
         }
 
@@ -3095,6 +3590,13 @@
                     const history = data.history || [];
                     if (history.length === 0) {
                         container.innerHTML = '<div class="loading-indicator">No history available</div>';
+                        // Reset stats to 0 when no history
+                        const approvedEl = document.getElementById('approved-today');
+                        const rejectedEl = document.getElementById('rejected-today');
+                        const totalEl = document.getElementById('total-processed');
+                        if (approvedEl) approvedEl.textContent = '0';
+                        if (rejectedEl) rejectedEl.textContent = '0';
+                        if (totalEl) totalEl.textContent = '0';
                         return;
                     }
 
@@ -3115,11 +3617,51 @@
                     });
                     html += '</tbody></table>';
                     container.innerHTML = html;
+
+                    // Update approval stats from history data
+                    const today = new Date().toDateString();
+                    let approvedToday = 0, rejectedToday = 0;
+                    history.forEach(entry => {
+                        const entryDate = new Date(entry.timestamp).toDateString();
+                        if (entryDate === today) {
+                            if (entry.action === 'approved') approvedToday++;
+                            else if (entry.action === 'rejected') rejectedToday++;
+                        }
+                    });
+                    const approvedEl = document.getElementById('approved-today');
+                    const rejectedEl = document.getElementById('rejected-today');
+                    const totalEl = document.getElementById('total-processed');
+                    if (approvedEl) approvedEl.textContent = approvedToday;
+                    if (rejectedEl) rejectedEl.textContent = rejectedToday;
+                    if (totalEl) totalEl.textContent = history.length;
                 })
                 .catch(err => {
                     console.error('Error loading device history:', err);
                     document.getElementById('device-history-container').innerHTML =
                         '<div class="loading-indicator">Error loading history</div>';
+                });
+        }
+
+        function clearDeviceHistory() {
+            if (!confirm('Are you sure you want to clear the entire device approval history? This cannot be undone.')) {
+                return;
+            }
+
+            fetch('/api/device_history/clear', {
+                method: 'POST'
+            })
+                .then(resp => resp.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        alert('Device history cleared successfully');
+                        loadDeviceHistory();
+                    } else {
+                        alert('Error: ' + (data.message || 'Failed to clear history'));
+                    }
+                })
+                .catch(err => {
+                    console.error('Error clearing history:', err);
+                    alert('Error clearing history');
                 });
         }
 
@@ -3129,10 +3671,12 @@
             if (approvalRefreshInterval) return;
             loadPendingDevices();
             loadDeviceHistory();
+            loadFailedTokenRequests();
             approvalRefreshInterval = setInterval(() => {
                 if (document.getElementById('approval').classList.contains('active')) {
                     loadPendingDevices();
                     loadDeviceHistory();
+                    loadFailedTokenRequests();
                 }
             }, 5000);
         }
@@ -3172,6 +3716,54 @@
                     }
                 });
             });
+        });
+        // ===== System Reset Functions =====
+        function showResetModal() {
+            const modal = document.getElementById('reset-modal');
+            modal.style.display = 'flex';
+        }
+
+        function hideResetModal() {
+            const modal = document.getElementById('reset-modal');
+            modal.style.display = 'none';
+        }
+
+        function performSystemReset() {
+            const btn = document.getElementById('confirm-reset-btn');
+            btn.textContent = 'Resetting...';
+            btn.style.opacity = '0.7';
+            btn.style.pointerEvents = 'none';
+
+            fetch('/api/system_reset', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+            })
+                .then(resp => resp.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        hideResetModal();
+                        // Show brief success message then reload
+                        alert('✅ System reset complete!\n\nAll devices, certificates, and state have been cleared.\nESP32 devices will auto-reconnect as new pending devices.');
+                        window.location.reload();
+                    } else {
+                        alert('❌ Reset failed: ' + (data.message || 'Unknown error'));
+                        btn.textContent = 'Yes, Reset Everything';
+                        btn.style.opacity = '1';
+                        btn.style.pointerEvents = 'auto';
+                    }
+                })
+                .catch(err => {
+                    console.error('System reset error:', err);
+                    alert('❌ Reset failed: Network error');
+                    btn.textContent = 'Yes, Reset Everything';
+                    btn.style.opacity = '1';
+                    btn.style.pointerEvents = 'auto';
+                });
+        }
+
+        // Close reset modal on Escape key
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') hideResetModal();
         });
     </script>
 </body>

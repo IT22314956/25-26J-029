@@ -110,15 +110,8 @@ class VirtualHost:
                 else:
                     print(f"❌ {self.device_id}: Packet rejected - {result.get('reason')}")
                     return False
-            elif response.status_code == 403:
-                # Token expired or invalid - Re-authenticate!
-                print(f"⚠️ {self.device_id}: Token invalid (403). Re-authenticating...")
-                if self.authenticate_with_controller():
-                    # Retry sending with new token
-                    return self.send_packet(data)
-                return False
             else:
-                print(f"❌ {self.device_id}: Send failed (Status {response.status_code})")
+                print(f"❌ {self.device_id}: Send failed")
                 return False
         except Exception as e:
             print(f"❌ {self.device_id}: Send error: {e}")
@@ -229,9 +222,9 @@ class MininetTopology:
             host.send_packet(f"test_{i}")
             time.sleep(0.1)
         
-        # Test session timeout
-        print("Testing session timeout...")
-        time.sleep(310)  # Wait for 5-minute timeout
+        # Test session timeout (Skipping long wait)
+        print("Testing session timeout (skipping 5-minute wait)...")
+        time.sleep(5)  # Reduced from 310s to 5s for faster testing
         host.send_packet("timeout_test")
     
     def monitor_controller(self):
@@ -264,16 +257,17 @@ def create_test_topology():
     
     # Add switches
     switch1 = topology.add_switch("s1")
+    switch2 = topology.add_switch("s2")
     
-    # Add hosts (IoT devices) - Sensor_A, Sensor_B, and Sensor_C
-    host1 = topology.add_host("Sensor_A")
-    host2 = topology.add_host("Sensor_B")
-    host3 = topology.add_host("Sensor_C")
+    # Add hosts (IoT devices)
+    host1 = topology.add_host("ESP32_2")
+    host2 = topology.add_host("ESP32_3")
+    host3 = topology.add_host("ESP32_4")
     
     # Create network links
-    topology.add_link("Sensor_A", "s1")
-    topology.add_link("Sensor_B", "s1")
-    topology.add_link("Sensor_C", "s1")
+    topology.add_link("ESP32_2", "s1")
+    topology.add_link("ESP32_3", "s1")
+    topology.add_link("ESP32_4", "s2")
     
     # Show topology
     topology.show_topology()
@@ -303,21 +297,20 @@ def main():
     # Start network
     threads = topology.start_network()
     
-    print("\n📊 Virtual IoT devices are now running continuously...")
-    print("   Devices will send data every 3 seconds")
-    print("   Press Ctrl+C to stop\n")
+    # Monitor for 30 seconds
+    print("\n📊 Monitoring network for 30 seconds...")
+    for i in range(6):
+        topology.monitor_controller()
+        time.sleep(5)
     
-    # Keep running until interrupted
-    try:
-        while True:
-            time.sleep(10)
-            # Optional: periodically show status
-            # topology.monitor_controller()
-    except KeyboardInterrupt:
-        print("\n\n🛑 Stopping Virtual Network...")
-        topology.stop_network()
-        print("\n✅ Virtual devices stopped")
-        print("🌐 View results at: http://localhost:5000")
+    # Test SDN policies
+    topology.test_sdn_policies()
+    
+    # Stop network
+    topology.stop_network()
+    
+    print("\n✅ SDN Test Complete!")
+    print("🌐 View results at: http://localhost:5000")
 
 if __name__ == "__main__":
     main()

@@ -43,7 +43,7 @@ class DeviceAttestation:
         logger.info(f"Attestation started for {device_id}")
     
     def perform_attestation(self, device_id: str, certificate_path: Optional[str] = None,
-                          certificate_manager=None, last_seen_timestamp: Optional[float] = None) -> Dict:
+                          certificate_manager=None) -> Dict:
         """
         Perform attestation check for a device
         
@@ -51,7 +51,6 @@ class DeviceAttestation:
             device_id: Device identifier
             certificate_path: Path to device certificate
             certificate_manager: Certificate manager instance (optional)
-            last_seen_timestamp: Timestamp when device was last seen (optional)
             
         Returns:
             Attestation result dictionary
@@ -85,26 +84,14 @@ class DeviceAttestation:
                 'message': 'Certificate check skipped (no certificate manager)'
             }
         
-        #Check 2: Heartbeat (device is alive and responding)
-        # Use provided last_seen_timestamp if available (from DB), otherwise use local state
-        last_heartbeat = last_seen_timestamp if last_seen_timestamp else attestation_data.get('last_heartbeat')
-        
-        # Skip heartbeat check for test devices (mininet virtual devices)
-        test_devices = ['Sensor_A', 'Sensor_B']
-        if device_id in test_devices:
-            result['checks']['heartbeat'] = {
-                'passed': True,
-                'message': 'Heartbeat check skipped for test device'
-            }
-        elif last_heartbeat:
+        # Check 2: Heartbeat (device is alive and responding)
+        last_heartbeat = attestation_data.get('last_heartbeat')
+        if last_heartbeat:
             time_since_heartbeat = current_time - last_heartbeat
-            # Allow up to 2x interval for heartbeat (or 60s window if interval is small)
-            timeout = max(self.attestation_interval * 2, 60)
-            heartbeat_valid = time_since_heartbeat < timeout
-            
+            heartbeat_valid = time_since_heartbeat < (self.attestation_interval * 2)
             result['checks']['heartbeat'] = {
                 'passed': heartbeat_valid,
-                'message': f'Heartbeat received {time_since_heartbeat:.0f}s ago' if heartbeat_valid else f'No heartbeat for {time_since_heartbeat:.0f}s'
+                'message': f'Heartbeat received {time_since_heartbeat:.0f}s ago' if heartbeat_valid else 'No recent heartbeat'
             }
             if not heartbeat_valid:
                 result['passed'] = False
@@ -157,7 +144,7 @@ class DeviceAttestation:
         self.device_attestations[device_id]['heartbeat_received'] = True
         self.device_attestations[device_id]['last_heartbeat'] = time.time()
         
-        logger.debug(f"Heartbeat locally recorded from {device_id}")
+        logger.debug(f"Heartbeat received from {device_id}")
     
     def get_attestation_status(self, device_id: str) -> Optional[Dict]:
         """
