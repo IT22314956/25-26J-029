@@ -32,10 +32,6 @@ Thumbs.db
 test_certs*
 *.tmp
 
-# Keep these databases (they're needed)
-!identity.db
-!pending_devices.db
-
 # Keep logs directory structure
 logs/
 !logs/.gitkeep

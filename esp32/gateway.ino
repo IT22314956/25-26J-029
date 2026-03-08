@@ -8,12 +8,12 @@ const char *ap_ssid = "ESP32-AP";     // AP name for nodes to connect
 const char *ap_password = "12345678"; // AP password (min 8 chars)
 
 // WiFi Station Configuration (connects to your network)
-const char *sta_ssid = "Shanaka";   // Your WiFi network name
-const char *sta_password = "12345678"; // Your WiFi password
+const char *sta_ssid = "iPhone (2)";   // Your WiFi network name
+const char *sta_password = "55566678"; // Your WiFi password
 
 // Controller Configuration
 const char *controller_ip =
-    "172.20.10.10"; // Raspberry Pi IP where controller.py runs
+    "172.20.10.3"; // Raspberry Pi IP where controller.py runs
 const int controller_port = 5000;
 
 // Gateway HTTP Server — WebServer handles concurrent clients properly

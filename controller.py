@@ -68,6 +68,31 @@ except ImportError as e:
     def get_ml_engine():
         return None
 
+# Import heuristic DDoS detector as fallback when ML engine is not available
+try:
+    from simple_ddos_detector import SimpleDDoSDetector
+    ddos_detector = SimpleDDoSDetector()
+    DDOS_DETECTOR_AVAILABLE = True
+    print(" [OK] Heuristic DDoS detector initialized (fallback)")
+except ImportError as e:
+    ddos_detector = None
+    DDOS_DETECTOR_AVAILABLE = False
+    print(f"⚠️  Heuristic DDoS detector not available: {e}")
+
+# Import honeypot modules
+try:
+    from honeypot_manager.honeypot_deployer import HoneypotDeployer
+    from honeypot_manager.threat_intelligence import ThreatIntelligence
+    honeypot_deployer = HoneypotDeployer("cowrie")
+    threat_intelligence = ThreatIntelligence()
+    HONEYPOT_AVAILABLE = True
+    print(" [OK] Honeypot manager initialized")
+except ImportError as e:
+    honeypot_deployer = None
+    threat_intelligence = None
+    HONEYPOT_AVAILABLE = False
+    print(f"⚠️  Honeypot manager not available: {e}")
+
 app = Flask(__name__)
 
 # Device authorization (static for now, can be dynamic)
@@ -109,9 +134,16 @@ sdn_metrics = {
 suspicious_device_alerts = []  # List of alert dictionaries
 _last_trust_reduction = {}  # {device_id: timestamp} — rate-limit trust score hits
 
+# Honeypot activity log — tracks redirection/blocking events for the dashboard
+honeypot_activity_log = []  # [{timestamp, device_id, event_type, details, trust_score}]
+
 # Initialize ML Security Engine
 ml_engine = None
 ml_monitoring_active = False
+
+# Track when system was last reset to enforce a cooldown period
+_system_reset_time = 0
+RESET_COOLDOWN_SECONDS = 5  # Reject device token requests for this long after reset
 
 # Security flag: disallow insecure auto-authorization unless explicitly enabled
 ALLOW_INSECURE_AUTO_AUTH = os.getenv("ALLOW_INSECURE_AUTO_AUTH", "false").lower() == "true"
@@ -209,14 +241,16 @@ elif PENDING_MANAGER_AVAILABLE:
 try:
     from trust_evaluator.trust_scorer import TrustScorer
     trust_scorer = TrustScorer(
-        initial_score=70,
+        initial_score=0,
         identity_db=onboarding.identity_db if (ONBOARDING_AVAILABLE and onboarding) else None
     )
     TRUST_SCORER_AVAILABLE = True
+    MAX_TRUST_SCORE = 100  # Maximum trust score devices can reach through normal behavior
     print(" [OK] Trust Scorer initialized")
 except Exception as e:
     trust_scorer = None
     TRUST_SCORER_AVAILABLE = False
+    MAX_TRUST_SCORE = 100
     print(f"⚠️  Trust Scorer not available: {e}")
 
 # Hydrate trust scores for all known authorized devices at startup
@@ -348,7 +382,7 @@ def onboard_device():
             if TRUST_SCORER_AVAILABLE and trust_scorer:
                 if trust_scorer.get_trust_score(device_id) is None:
                     trust_scorer.initialize_device(device_id)
-                    app.logger.info(f"✅ Trust score initialized for onboarded device {device_id}: 70")
+                    app.logger.info(f"✅ Trust score initialized for onboarded device {device_id}: 0")
             
             app.logger.info(f"Device {device_id} onboarded. Profiling will auto-finalize after 5 minutes.")
             return json.dumps(result), 200
@@ -459,6 +493,25 @@ def get_token():
     
     app.logger.info(f"Token request from device_id: {device_id}, MAC: {mac_address}")
     app.logger.debug(f"Full request data: {data}")
+
+    # Reject token requests during post-reset cooldown so dashboard shows clean state
+    if time.time() - _system_reset_time < RESET_COOLDOWN_SECONDS:
+        app.logger.info(f"Token request from {device_id} rejected — system reset cooldown active")
+        return json.dumps({'error': 'System reset in progress, please retry shortly'}), 503
+
+    # Block devices that have been redirected to the honeypot — they must NOT reconnect
+    for alert in suspicious_device_alerts:
+        if alert.get('device_id') == device_id and alert.get('redirected'):
+            app.logger.warning(f"🚫 Token request from {device_id} BLOCKED — device was redirected to honeypot")
+            honeypot_activity_log.append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'device_id': device_id,
+                'event_type': 'token_blocked',
+                'details': 'Reconnection attempt blocked — device redirected to honeypot',
+                'trust_score': None,
+                'severity': 'high'
+            })
+            return json.dumps({'error': 'Device blocked — redirected to honeypot'}), 403
     
     # Normalize MAC for downstream checks
     if isinstance(mac_address, str):
@@ -605,7 +658,7 @@ def get_token():
     if TRUST_SCORER_AVAILABLE and trust_scorer:
         if trust_scorer.get_trust_score(device_id) is None:
             trust_scorer.initialize_device(device_id)
-            app.logger.info(f"✅ Trust score initialized for authenticated device {device_id}: 70")
+            app.logger.info(f"✅ Trust score initialized for authenticated device {device_id}: 0")
     
     app.logger.info(f"Token generated successfully for device {device_id}")
     return json.dumps({'token': token})
@@ -732,51 +785,132 @@ def data():
                 'udp_length': data.get('udp_length', 0)
             })
             
-            # Check if ML detected high-confidence attack and trigger redirection
+            # Check if ML detected high-confidence attack
             if result and result.get('is_attack', False) and result.get('confidence', 0) > 0.8:
                 is_attack_detected = True
-                # Rate-limit trust score reduction: only once per 60s per device
                 last_alert_time = _last_trust_reduction.get(device_id, 0)
                 if current_time - last_alert_time > 60:  # 60s cooldown
                     severity = 'high' if result.get('confidence', 0) > 0.9 else 'medium'
+                    # Create alert but do NOT auto-redirect — only redirect when score < 30
                     create_suspicious_device_alert(
                         device_id=device_id,
                         reason='ml_detection',
                         severity=severity,
-                        redirected=True
+                        redirected=False
                     )
                     _last_trust_reduction[device_id] = current_time
-                    app.logger.warning(f"High-confidence ML attack detected for {device_id}: {result.get('attack_type')}")
+                    # Check if trust score dropped below 30 — then redirect to honeypot
+                    post_score = trust_scorer.get_trust_score(device_id) if TRUST_SCORER_AVAILABLE and trust_scorer else None
+                    if post_score is not None and post_score < 30:
+                        for alert in suspicious_device_alerts:
+                            if alert.get('device_id') == device_id:
+                                alert['redirected'] = True
+                                break
+                        app.logger.warning(f"🔴 Device {device_id} score={post_score} < 30 — REDIRECTED to honeypot")
+                        honeypot_activity_log.append({
+                            'timestamp': datetime.utcnow().isoformat(),
+                            'device_id': device_id,
+                            'event_type': 'redirected',
+                            'details': f'ML detection — trust score {post_score} dropped below 30',
+                            'trust_score': post_score,
+                            'severity': 'critical'
+                        })
+                    else:
+                        app.logger.warning(f"⚠️ ML attack detected for {device_id} (score={post_score}), not yet redirected")
                 else:
-                    # Update detection count on existing alert without reducing trust again
                     for alert in suspicious_device_alerts:
                         if alert.get('device_id') == device_id:
                             alert['detection_count'] = alert.get('detection_count', 0) + 1
                             break
     except Exception as e:
-        # Non-fatal for data ingestion; continue normally
         app.logger.warning(f"ML prediction error (non-fatal): {str(e)}")
 
+    # Heuristic DDoS detection — ALWAYS runs so stats accumulate for ML tab
+    if DDOS_DETECTOR_AVAILABLE and ddos_detector:
+        try:
+            heuristic_result = ddos_detector.detect({
+                'size': data.get('size', 0),
+                'protocol': data.get('protocol', 6),
+                'rate': data.get('rate', 0.0),
+                'pps': data.get('pps', 0.0),
+                'duration': data.get('duration', 0.0),
+            })
+
+            if not is_attack_detected and heuristic_result and heuristic_result.get('is_attack', False) and heuristic_result.get('confidence', 0) > 0.7:
+                is_attack_detected = True
+                # Apply small trust reduction on EVERY detected attack packet (no cooldown)
+                if TRUST_SCORER_AVAILABLE and trust_scorer:
+                    current_score = trust_scorer.get_trust_score(device_id)
+                    if current_score is not None:
+                        trust_scorer.adjust_trust_score(device_id, -5, f"Attack traffic: {heuristic_result.get('attack_type', 'ddos')}")
+
+                # Create/update alert with 60s cooldown (for logging/detection UI)
+                last_alert_time = _last_trust_reduction.get(device_id, 0)
+                if current_time - last_alert_time > 60:  # 60s cooldown for alert creation
+                    severity = 'high' if heuristic_result.get('confidence', 0) > 0.85 else 'medium'
+                    create_suspicious_device_alert(
+                        device_id=device_id,
+                        reason='heuristic_ddos_detection',
+                        severity=severity,
+                        redirected=False
+                    )
+                    _last_trust_reduction[device_id] = current_time
+                    # Check if trust score dropped below 30 — then redirect to honeypot
+                    post_score = trust_scorer.get_trust_score(device_id) if TRUST_SCORER_AVAILABLE and trust_scorer else None
+                    if post_score is not None and post_score < 30:
+                        for alert in suspicious_device_alerts:
+                            if alert.get('device_id') == device_id:
+                                alert['redirected'] = True
+                                break
+                        app.logger.warning(f"🔴 Device {device_id} score={post_score} < 30 — REDIRECTED to honeypot")
+                        honeypot_activity_log.append({
+                            'timestamp': datetime.utcnow().isoformat(),
+                            'device_id': device_id,
+                            'event_type': 'redirected',
+                            'details': f'Heuristic DDoS detection — trust score {post_score} dropped below 30',
+                            'trust_score': post_score,
+                            'severity': 'critical'
+                        })
+                    else:
+                        app.logger.warning(
+                            f"⚠️ Heuristic DDoS detected for {device_id}: "
+                            f"{heuristic_result.get('attack_type')} (score={post_score}, not yet redirected)"
+                        )
+                else:
+                    for alert in suspicious_device_alerts:
+                        if alert.get('device_id') == device_id:
+                            alert['detection_count'] = alert.get('detection_count', 0) + 1
+                            # Also check if score dropped below 30 from per-packet reduction
+                            post_score = trust_scorer.get_trust_score(device_id) if TRUST_SCORER_AVAILABLE and trust_scorer else None
+                            if post_score is not None and post_score < 30 and not alert.get('redirected'):
+                                alert['redirected'] = True
+                                app.logger.warning(f"🔴 Device {device_id} score={post_score} < 30 — REDIRECTED to honeypot")
+                                honeypot_activity_log.append({
+                                    'timestamp': datetime.utcnow().isoformat(),
+                                    'device_id': device_id,
+                                    'event_type': 'redirected',
+                                    'details': f'Per-packet reduction — trust score {post_score} dropped below 30',
+                                    'trust_score': post_score,
+                                    'severity': 'critical'
+                                })
+                            break
+        except Exception as e:
+            app.logger.warning(f"Heuristic detection error (non-fatal): {str(e)}")
+
     # Trust recovery: normal (non-attack) traffic slowly restores trust score
+    # NOTE: devices with ANY active suspicious alert do NOT recover — prevents score climbing during attacks
     if not is_attack_detected and TRUST_SCORER_AVAILABLE and trust_scorer:
         try:
-            current_score = trust_scorer.get_trust_score(device_id)
-            
-            # Gradually recover trust for normal traffic
-            if current_score is not None and current_score < trust_scorer.initial_score:
-                trust_scorer.adjust_trust_score(device_id, +2, "Normal behavior observed")
+            # Check if device has any active suspicious alert — if so, skip recovery
+            has_active_alert = any(
+                a.get('device_id') == device_id
+                for a in suspicious_device_alerts
+            )
+            if not has_active_alert:
                 current_score = trust_scorer.get_trust_score(device_id)
-            
-            # Always check: if score is >= 30, clear any stale redirected flags
-            # This runs even if the score is already at 70
-            if current_score is not None and current_score >= 30:
-                for alert in suspicious_device_alerts:
-                    if alert.get('device_id') == device_id and alert.get('redirected'):
-                        alert['redirected'] = False
-                        app.logger.info(
-                            f"✅ Device {device_id} trust at {current_score}, "
-                            f"clearing honeypot redirect — device will reconnect on map"
-                        )
+                # Gradually increase trust for normal traffic up to MAX_TRUST_SCORE (100)
+                if current_score is not None and current_score < MAX_TRUST_SCORE:
+                    trust_scorer.adjust_trust_score(device_id, +5, "Normal behavior observed")
         except Exception:
             pass
 
@@ -1148,8 +1282,8 @@ def get_topology_with_mac():
                "Unknown")
         
         # Get trust score and level for this device
-        node_trust_score = 70  # default
-        node_trust_level = 'trusted'
+        node_trust_score = 0  # default for new/unknown devices
+        node_trust_level = 'untrusted'
         if TRUST_SCORER_AVAILABLE and trust_scorer:
             ts = trust_scorer.get_trust_score(device_id)
             if ts is not None:
@@ -1691,10 +1825,8 @@ def get_trust_scores():
         
         # Use live TrustScorer for real-time scores
         if TRUST_SCORER_AVAILABLE and trust_scorer:
-            # Auto-initialize any known devices not yet tracked by the trust scorer
-            for dev_id in set(list(authorized_devices.keys()) + list(device_data.keys())):
-                if trust_scorer.get_trust_score(dev_id) is None:
-                    trust_scorer.initialize_device(dev_id)
+            # Only return scores for devices already tracked — do NOT auto-initialize
+            # so that after a system reset the dashboard shows a clean empty state
             scores = trust_scorer.get_all_scores()
         # Fallback to database
         elif ONBOARDING_AVAILABLE and onboarding:
@@ -1862,6 +1994,12 @@ def get_sdn_metrics():
 def initialize_ml():
     """Initialize the ML security engine"""
     if not ML_ENGINE_AVAILABLE:
+        # If heuristic detector is available, report success with heuristic mode
+        if DDOS_DETECTOR_AVAILABLE and ddos_detector:
+            return json.dumps({
+                'status': 'success',
+                'message': 'Using heuristic DDoS detection (TensorFlow not installed)'
+            })
         return json.dumps({'status': 'error', 'message': 'ML engine not available (TensorFlow not installed)'})
     
     global ml_engine, ml_monitoring_active
@@ -1885,10 +2023,26 @@ def initialize_ml():
 def ml_status():
     """Get ML engine status"""
     if not ML_ENGINE_AVAILABLE:
+        # Return heuristic detector stats when ML engine is not available
+        heuristic_stats = {}
+        if DDOS_DETECTOR_AVAILABLE and ddos_detector:
+            detector_stats = ddos_detector.get_statistics()
+            heuristic_stats = {
+                'total_packets': detector_stats.get('total_packets', 0),
+                'attack_packets': detector_stats.get('detected_attacks', 0),
+                'normal_packets': detector_stats.get('total_packets', 0) - detector_stats.get('detected_attacks', 0),
+                'attack_rate': detector_stats.get('detection_rate', 0.0),
+                'detection_accuracy': detector_stats.get('detection_rate', 0.0),
+                'processing_rate': 0,
+                'model_confidence': 0,
+                'model_status': 'Heuristic Detection (No TensorFlow)',
+                'uptime': time.time() - _system_reset_time if _system_reset_time > 0 else 0,
+            }
         return json.dumps({
-            'status': 'unavailable',
-            'monitoring': False,
-            'message': 'ML engine not available (TensorFlow not installed)'
+            'status': 'active' if DDOS_DETECTOR_AVAILABLE else 'unavailable',
+            'monitoring': DDOS_DETECTOR_AVAILABLE,
+            'message': 'Using heuristic DDoS detection (TensorFlow not installed)',
+            'statistics': heuristic_stats
         })
     
     global ml_engine, ml_monitoring_active
@@ -1921,11 +2075,33 @@ def ml_status():
 def ml_detections():
     """Get recent attack detections"""
     if not ML_ENGINE_AVAILABLE:
+        # Return heuristic detections when ML engine is not available
+        heuristic_detections = []
+        # Use suspicious device alerts as detection source
+        for alert in suspicious_device_alerts:
+            heuristic_detections.append({
+                'timestamp': alert.get('timestamp'),
+                'is_attack': True,
+                'attack_type': alert.get('reason', 'heuristic_detection'),
+                'confidence': 0.85,
+                'device_id': alert.get('device_id', 'Unknown'),
+                'details': f"Severity: {alert.get('severity', 'unknown')}, Detections: {alert.get('detection_count', 1)}"
+            })
+        # Also include recent attacks from the heuristic detector
+        if DDOS_DETECTOR_AVAILABLE and ddos_detector:
+            for attack in ddos_detector.get_recent_attacks(10):
+                heuristic_detections.append({
+                    'timestamp': attack.get('timestamp', datetime.now()).isoformat() if hasattr(attack.get('timestamp', ''), 'isoformat') else str(attack.get('timestamp', '')),
+                    'is_attack': True,
+                    'attack_type': attack.get('attack_type', 'ddos'),
+                    'confidence': float(attack.get('confidence', 0.0)),
+                    'details': attack.get('reason', '')
+                })
         return json.dumps({
-            'error': 'ML engine not available',
-            'status': 'error',
-            'message': 'TensorFlow not installed'
-        }), 503
+            'status': 'success',
+            'detections': heuristic_detections[-20:],
+            'stats': ddos_detector.get_statistics() if DDOS_DETECTOR_AVAILABLE and ddos_detector else {}
+        }), 200
     
     try:
         global ml_engine, ml_monitoring_active
@@ -2029,23 +2205,54 @@ def network_statistics():
         
         # Get ML engine statistics if available
         global ml_engine
+        ml_total = 0
+        ml_attack = 0
+        ml_attack_rate = 0.0
+        ml_detection_accuracy = 0.0
+        ml_processing_rate = 0.0
+        ml_model_confidence = 0.0
+
         if ml_engine and hasattr(ml_engine, 'get_attack_statistics'):
             try:
                 ml_stats = ml_engine.get_attack_statistics()
-                stats['ml_engine'] = {
-                    'total_packets': ml_stats.get('total_packets', 0),
-                    'attack_packets': ml_stats.get('attack_packets', 0),
-                    'normal_packets': ml_stats.get('normal_packets', 0),
-                    'attack_rate': ml_stats.get('attack_rate', 0.0),
-                    'detection_accuracy': ml_stats.get('detection_accuracy', 0.0),
-                    'processing_rate': ml_stats.get('processing_rate', 0.0),
-                    'model_confidence': ml_stats.get('model_confidence', 0.0)
-                }
+                ml_total = ml_stats.get('total_packets', 0)
+                ml_attack = ml_stats.get('attack_packets', 0)
+                ml_attack_rate = ml_stats.get('attack_rate', 0.0)
+                ml_detection_accuracy = ml_stats.get('detection_accuracy', 0.0)
+                ml_processing_rate = ml_stats.get('processing_rate', 0.0)
+                ml_model_confidence = ml_stats.get('model_confidence', 0.0)
             except Exception as e:
                 app.logger.warning(f"Error getting ML statistics: {e}")
-                stats['ml_engine'] = {}
-        else:
-            stats['ml_engine'] = {}
+
+        # Always also get heuristic detector stats (runs on every packet)
+        if DDOS_DETECTOR_AVAILABLE and ddos_detector:
+            detector_stats = ddos_detector.get_statistics()
+            h_total = detector_stats.get('total_packets', 0)
+            h_attack = detector_stats.get('detected_attacks', 0)
+            h_rate = detector_stats.get('detection_rate', 0.0)
+            # Use whichever source has more data
+            if h_total > ml_total:
+                ml_total = h_total
+            if h_attack > ml_attack:
+                ml_attack = h_attack
+            if h_rate > ml_attack_rate:
+                ml_attack_rate = h_rate
+            if h_rate > ml_detection_accuracy:
+                ml_detection_accuracy = h_rate
+
+        total_network_packets = sum(sum(device_data.get(d, [])) for d in device_data)
+        if total_network_packets > ml_total:
+            ml_total = total_network_packets
+
+        stats['ml_engine'] = {
+            'total_packets': ml_total,
+            'attack_packets': ml_attack,
+            'normal_packets': ml_total - ml_attack,
+            'attack_rate': ml_attack_rate,
+            'detection_accuracy': ml_detection_accuracy,
+            'processing_rate': ml_processing_rate,
+            'model_confidence': ml_model_confidence
+        }
         
         # Get device-specific statistics
         device_stats = {}
@@ -2563,6 +2770,137 @@ def remove_device_redirect(device_id):
             'message': str(e)
         }), 500
 
+# ──────────────────── Honeypot Management Endpoints ────────────────────
+
+@app.route('/api/honeypot/status')
+def honeypot_status():
+    """Get honeypot system status — Cowrie container + activity stats"""
+    try:
+        # Cowrie Docker status
+        cowrie_status = 'unavailable'
+        cowrie_info = {}
+        if HONEYPOT_AVAILABLE and honeypot_deployer:
+            try:
+                cowrie_info = honeypot_deployer.get_honeypot_info()
+                cowrie_status = cowrie_info.get('status') or 'not_deployed'
+            except Exception:
+                cowrie_status = 'error'
+
+        # Activity stats from in-memory log
+        total_redirections = sum(1 for e in honeypot_activity_log if e.get('event_type') == 'redirected')
+        total_blocks = sum(1 for e in honeypot_activity_log if e.get('event_type') == 'token_blocked')
+        active_redirected = sum(
+            1 for a in suspicious_device_alerts if a.get('redirected', False)
+        )
+
+        return json.dumps({
+            'status': 'success',
+            'cowrie': {
+                'status': cowrie_status,
+                'container_name': cowrie_info.get('container_name', 'iot_honeypot_cowrie'),
+                'ssh_port': cowrie_info.get('ssh_port', 2222),
+                'http_port': cowrie_info.get('http_port', 8080),
+                'running': cowrie_info.get('running', False),
+                'docker_available': HONEYPOT_AVAILABLE and honeypot_deployer and honeypot_deployer.docker_manager.is_available() if HONEYPOT_AVAILABLE else False
+            },
+            'activity': {
+                'total_redirections': total_redirections,
+                'total_blocks': total_blocks,
+                'active_redirected_devices': active_redirected,
+                'total_events': len(honeypot_activity_log)
+            }
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Error getting honeypot status: {e}")
+        return json.dumps({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/honeypot/logs')
+def honeypot_logs():
+    """Get honeypot activity logs — redirections, blocks, and Cowrie logs"""
+    try:
+        limit = request.args.get('limit', 100, type=int)
+
+        # Get SDN honeypot activity (redirections + blocks)
+        sdn_events = list(reversed(honeypot_activity_log[-limit:]))
+
+        # Get Cowrie Docker logs if container is running
+        cowrie_logs = []
+        if HONEYPOT_AVAILABLE and honeypot_deployer:
+            try:
+                if honeypot_deployer.is_running():
+                    raw_logs = honeypot_deployer.get_logs(tail=50)
+                    if raw_logs and threat_intelligence:
+                        threats = threat_intelligence.process_logs(raw_logs)
+                        for t in threats[-limit:]:
+                            cowrie_logs.append({
+                                'timestamp': t.get('timestamp', datetime.utcnow().isoformat()),
+                                'device_id': t.get('device_id', t.get('source_ip', 'unknown')),
+                                'event_type': 'cowrie_' + t.get('event_type', 'event'),
+                                'details': t.get('command', t.get('event_type', '')),
+                                'trust_score': None,
+                                'severity': 'medium'
+                            })
+            except Exception as e:
+                app.logger.warning(f"Error reading Cowrie logs: {e}")
+
+        # Merge and sort by timestamp
+        all_events = sdn_events + cowrie_logs
+        all_events.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+
+        return json.dumps({
+            'status': 'success',
+            'events': all_events[:limit],
+            'total': len(honeypot_activity_log),
+            'cowrie_running': HONEYPOT_AVAILABLE and honeypot_deployer and honeypot_deployer.is_running() if HONEYPOT_AVAILABLE else False
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Error getting honeypot logs: {e}")
+        return json.dumps({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/honeypot/deploy', methods=['POST'])
+def deploy_honeypot():
+    """Deploy Cowrie honeypot Docker container"""
+    if not HONEYPOT_AVAILABLE:
+        return json.dumps({'status': 'error', 'message': 'Honeypot manager not available'}), 400
+    try:
+        success = honeypot_deployer.deploy()
+        if success:
+            honeypot_activity_log.append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'device_id': 'system',
+                'event_type': 'cowrie_deployed',
+                'details': 'Cowrie honeypot container deployed',
+                'trust_score': None,
+                'severity': 'info'
+            })
+            return json.dumps({'status': 'success', 'message': 'Cowrie honeypot deployed'}), 200
+        else:
+            return json.dumps({'status': 'error', 'message': 'Failed to deploy Cowrie — check Docker is running'}), 500
+    except Exception as e:
+        return json.dumps({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/honeypot/stop', methods=['POST'])
+def stop_honeypot():
+    """Stop Cowrie honeypot Docker container"""
+    if not HONEYPOT_AVAILABLE:
+        return json.dumps({'status': 'error', 'message': 'Honeypot manager not available'}), 400
+    try:
+        success = honeypot_deployer.stop()
+        if success:
+            honeypot_activity_log.append({
+                'timestamp': datetime.utcnow().isoformat(),
+                'device_id': 'system',
+                'event_type': 'cowrie_stopped',
+                'details': 'Cowrie honeypot container stopped',
+                'trust_score': None,
+                'severity': 'info'
+            })
+            return json.dumps({'status': 'success', 'message': 'Cowrie honeypot stopped'}), 200
+        else:
+            return json.dumps({'status': 'error', 'message': 'Failed to stop Cowrie'}), 500
+    except Exception as e:
+        return json.dumps({'status': 'error', 'message': str(e)}), 500
+
 @app.route('/api/system_reset', methods=['POST'])
 def system_reset():
     """
@@ -2574,8 +2912,10 @@ def system_reset():
     global device_tokens, packet_counts, failed_token_requests
     global mac_addresses, policy_logs, suspicious_device_alerts
     global _last_trust_reduction, ml_engine, ml_monitoring_active, sdn_policies
+    global _system_reset_time, honeypot_activity_log
 
     app.logger.warning("🔄 SYSTEM RESET requested — clearing ALL state...")
+    _system_reset_time = time.time()  # Start cooldown — reject device re-registration briefly
     errors = []
 
     # 1. Clear in-memory tracking structures
@@ -2590,6 +2930,7 @@ def system_reset():
     policy_logs.clear()
     suspicious_device_alerts.clear()
     _last_trust_reduction.clear()
+    honeypot_activity_log.clear()
 
     # Reset SDN policies to disabled
     for key in sdn_policies:
@@ -2648,25 +2989,68 @@ def system_reset():
         errors.append(f"certs: {e}")
         app.logger.error(f"  ❌ Failed to clean certificate files: {e}")
 
-    # 5. Reset trust scorer
+    # 5. Reset trust scorer (in-memory AND database)
     if TRUST_SCORER_AVAILABLE and trust_scorer:
         try:
             trust_scorer.device_scores.clear()
             trust_scorer.score_history.clear()
+            # Also explicitly clear trust scores from identity DB via the scorer's own reference
+            if trust_scorer.identity_db:
+                try:
+                    db_path = trust_scorer.identity_db.db_path
+                    conn = sqlite3.connect(db_path)
+                    cursor = conn.cursor()
+                    # Clear trust_scores table specifically if it exists
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trust_scores'")
+                    if cursor.fetchone():
+                        cursor.execute("DELETE FROM trust_scores")
+                    # Also clear any trust_score_history table
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trust_score_history'")
+                    if cursor.fetchone():
+                        cursor.execute("DELETE FROM trust_score_history")
+                    conn.commit()
+                    conn.close()
+                    app.logger.info("  ✅ Trust scores cleared from identity database")
+                except Exception as db_e:
+                    app.logger.warning(f"  ⚠️  Could not clear trust scores from DB: {db_e}")
             app.logger.info("  ✅ Trust scorer reset")
         except Exception as e:
             errors.append(f"trust_scorer: {e}")
             app.logger.error(f"  ❌ Failed to reset trust scorer: {e}")
 
-    # 6. Reset ML engine detection history
-    if ml_engine and hasattr(ml_engine, 'network_stats'):
+    # 6. Reset ML engine detection history (preserve structure, just zero out values)
+    if ml_engine:
         try:
-            ml_engine.network_stats = {}
+            if hasattr(ml_engine, 'network_stats') and isinstance(ml_engine.network_stats, dict):
+                for key in ml_engine.network_stats:
+                    if isinstance(ml_engine.network_stats[key], (int, float)):
+                        ml_engine.network_stats[key] = 0
+                    elif isinstance(ml_engine.network_stats[key], list):
+                        ml_engine.network_stats[key] = []
+                    elif isinstance(ml_engine.network_stats[key], dict):
+                        ml_engine.network_stats[key] = {}
             if hasattr(ml_engine, 'detection_history'):
-                ml_engine.detection_history = []
+                if isinstance(ml_engine.detection_history, list):
+                    ml_engine.detection_history.clear()
+                else:
+                    ml_engine.detection_history = []
+            if hasattr(ml_engine, 'attack_count'):
+                ml_engine.attack_count = 0
+            if hasattr(ml_engine, 'total_packets'):
+                ml_engine.total_packets = 0
+            if hasattr(ml_engine, 'normal_count'):
+                ml_engine.normal_count = 0
             app.logger.info("  ✅ ML engine stats reset")
         except Exception as e:
             errors.append(f"ml_engine: {e}")
+
+    # 7. Reset heuristic DDoS detector
+    if DDOS_DETECTOR_AVAILABLE and ddos_detector:
+        try:
+            ddos_detector.reset_statistics()
+            app.logger.info("  ✅ Heuristic DDoS detector reset")
+        except Exception as e:
+            errors.append(f"ddos_detector: {e}")
 
     app.logger.warning("🔄 SYSTEM RESET complete — system is fresh")
 
