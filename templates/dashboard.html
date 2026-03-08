@@ -1537,11 +1537,8 @@
                     <div class="metric-value" id="hp-active-blocked" style="color: #ff9800;">0</div>
                     <div class="metric-label">Currently blocked devices</div>
                 </div>
-                <div class="card">
-                    <h3>🔒 Token Rejections</h3>
-                    <div class="metric-value" id="hp-token-blocks" style="color: #9c27b0;">0</div>
-                    <div class="metric-label">Reconnection attempts blocked</div>
-                </div>
+
+
                 <div class="card">
                     <h3>🍯 Cowrie Status</h3>
                     <div class="metric-value" id="honeypot-status" style="color: #607d8b;">Not Deployed</div>
@@ -2559,11 +2556,31 @@
                 }
 
                 // Override with network stats if they have higher values (more complete data)
-                if (netData && netData.status === 'success' && netData.statistics && netData.statistics.ml_engine) {
-                    const ml = netData.statistics.ml_engine;
-                    if ((ml.total_packets || 0) > totalPackets) totalPackets = ml.total_packets;
-                    if ((ml.attack_packets || 0) > attackPackets) attackPackets = ml.attack_packets;
-                    if ((ml.attack_rate || 0) > attackRate) attackRate = ml.attack_rate;
+                let onlineDevices = 0;
+                let totalDevices = 0;
+                if (netData && netData.status === 'success' && netData.statistics) {
+                    if (netData.statistics.ml_engine) {
+                        const ml = netData.statistics.ml_engine;
+                        if ((ml.total_packets || 0) > totalPackets) totalPackets = ml.total_packets;
+                        if ((ml.attack_packets || 0) > attackPackets) attackPackets = ml.attack_packets;
+                        if ((ml.attack_rate || 0) > attackRate) attackRate = ml.attack_rate;
+                    }
+                    if (netData.statistics.network) {
+                        onlineDevices = netData.statistics.network.online_devices || 0;
+                        totalDevices = netData.statistics.network.total_devices || 0;
+                    }
+                }
+
+                // Check if any real devices are connected
+                const hasDevices = totalDevices > 0;
+                const hasRealTraffic = hasDevices && totalPackets > 0;
+
+                // If no devices connected, zero out ML stats (they are just self-test artifacts)
+                if (!hasDevices) {
+                    totalPackets = 0;
+                    attackPackets = 0;
+                    attackRate = 0;
+                    confidence = 0;
                 }
 
                 // Update stat elements
@@ -2579,12 +2596,23 @@
 
                 // Update status indicator
                 if (statusDot && statusText && statusSubtitle) {
-                    if (mlData && (mlData.status === 'active')) {
+                    if (!hasDevices) {
+                        // No devices connected at all
+                        statusDot.className = 'status-dot-large';
+                        statusDot.style.background = '#ff9800';
+                        statusDot.style.boxShadow = '0 0 0 3px rgba(255, 152, 0, 0.3)';
+                        statusText.textContent = 'Waiting for Devices';
+                        statusSubtitle.textContent = 'No devices connected — connect IoT devices to begin monitoring';
+                    } else if (mlData && (mlData.status === 'active')) {
                         statusDot.className = 'status-dot-large active';
+                        statusDot.style.background = '';
+                        statusDot.style.boxShadow = '';
                         statusText.textContent = 'Active - Monitoring';
-                        statusSubtitle.textContent = `Processing ${totalPackets} packets`;
+                        statusSubtitle.textContent = `Monitoring ${onlineDevices} device${onlineDevices !== 1 ? 's' : ''} — ${totalPackets} packets processed`;
                     } else {
                         statusDot.className = 'status-dot-large';
+                        statusDot.style.background = '';
+                        statusDot.style.boxShadow = '';
                         statusText.textContent = 'Initializing...';
                         statusSubtitle.textContent = 'Waiting for data...';
                     }
@@ -3159,13 +3187,12 @@
 
                     const redirEl = document.getElementById('hp-total-redirections');
                     const blockedEl = document.getElementById('hp-active-blocked');
-                    const tokenEl = document.getElementById('hp-token-blocks');
                     const statusEl = document.getElementById('honeypot-status');
                     const labelEl = document.getElementById('honeypot-status-label');
 
                     if (redirEl) redirEl.textContent = a.total_redirections || 0;
                     if (blockedEl) blockedEl.textContent = a.active_redirected_devices || 0;
-                    if (tokenEl) tokenEl.textContent = a.total_blocks || 0;
+
 
                     if (statusEl) {
                         if (c.running) {
@@ -3317,8 +3344,7 @@
                                     <td><span style="color: ${statusColor};">${(cert.status || 'unknown').toUpperCase()}</span></td>
                                     <td>${cert.valid_until || cert.expires || 'N/A'}</td>
                                     <td>
-                                        <button class="button button-danger" onclick="revokeCertificate('${cert.device_id}')" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Revoke</button>
-                                        <button class="button button-danger" onclick="removeDevice('${cert.device_id}')" style="padding: 0.25rem 0.5rem; font-size: 0.75rem; background-color: #d32f2f; margin-left: 0.25rem;">Delete</button>
+                                        <button class="button button-danger" onclick="removeDevice('${cert.device_id}')" style="padding: 0.25rem 0.5rem; font-size: 0.75rem; background-color: #d32f2f;">Delete</button>
                                     </td>
                                 </tr>
                             `;
@@ -3721,6 +3747,18 @@
                 });
         }
 
+        // Auto-refresh honeypot tab every 5s when active
+        let honeypotRefreshInterval = null;
+        function startHoneypotUpdates() {
+            if (honeypotRefreshInterval) return;
+            honeypotRefreshInterval = setInterval(() => {
+                if (document.getElementById('honeypot') &&
+                    document.getElementById('honeypot').classList.contains('active')) {
+                    updateHoneypotStatus();
+                }
+            }, 5000);
+        }
+
         // Auto-refresh pending devices when approval tab is active
         let approvalRefreshInterval = null;
         function startApprovalUpdates() {
@@ -3762,6 +3800,9 @@
             }
             // Start approval updates
             startApprovalUpdates();
+
+            // Start honeypot updates
+            startHoneypotUpdates();
 
             // Load approval data when tab is clicked
             document.querySelectorAll('.tab-button').forEach(btn => {
